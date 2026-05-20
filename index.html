@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OC Transpo Live — Bus Timeline</title>
+<meta name="description" content="Live OC Transpo bus locations and arrival times as a route timeline.">
+<meta name="theme-color" content="#0d0d0f">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header id="topbar">
+  <div class="brand">
+    <span class="brand-mark">🚌</span>
+    <span class="brand-text">OC Transpo <strong>Live</strong></span>
+  </div>
+  <div id="freshness" class="pill pill-muted" title="Feed freshness">
+    <span class="pill-dot"></span><span id="freshness-text">connecting…</span>
+  </div>
+  <button id="refresh-btn" class="icon-btn" title="Refresh now">⟳</button>
+  <button id="sidebar-toggle" class="icon-btn" title="Show / hide panel">☰</button>
+</header>
+
+<main id="layout">
+
+  <aside id="sidebar">
+
+    <section class="panel">
+      <h2>Lines</h2>
+      <p class="hint">Pick the routes &amp; directions to show as timelines.</p>
+      <div id="line-picker" class="line-picker"><!-- built by app.js --></div>
+    </section>
+
+    <section class="panel">
+      <h2>My stops</h2>
+      <p class="hint">Favourited stops get a big arrivals card up top — your
+        “rush or relax?” glance.</p>
+      <div id="fav-stops" class="fav-stops"><!-- built by app.js --></div>
+      <button id="nearby-btn" class="wide-btn">📍 Find stops near me</button>
+      <div id="nearby-list" class="nearby-list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Display</h2>
+      <label class="row-toggle">
+        <input type="checkbox" id="map-toggle">
+        <span>Show live map</span>
+      </label>
+      <label class="row-field">
+        <span>Auto-refresh</span>
+        <select id="refresh-select">
+          <option value="10">every 10s</option>
+          <option value="20" selected>every 20s</option>
+          <option value="30">every 30s</option>
+          <option value="60">every 60s</option>
+          <option value="0">off</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="panel panel-quiet">
+      <h2>Account</h2>
+      <div id="auth-area"><!-- built by app.js --></div>
+    </section>
+
+    <p class="credits">
+      Data: OC Transpo GTFS-Realtime. Schedule built
+      <span id="data-date">—</span>.<br>
+      Not affiliated with OC Transpo / the City of Ottawa.
+    </p>
+
+  </aside>
+
+  <section id="content">
+    <div id="departures-board"><!-- big favourite-stop cards --></div>
+    <div id="map-wrap" class="hidden"><div id="map"></div></div>
+    <div id="timelines"><!-- route timelines --></div>
+    <div id="empty-state" class="empty-state hidden">
+      No lines selected — pick one or more under <strong>Lines</strong>.
+    </div>
+  </section>
+
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="auth.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

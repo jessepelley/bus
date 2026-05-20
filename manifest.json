@@ -1,0 +1,13 @@
+{
+  "name": "OC Transpo Live",
+  "short_name": "Bus Live",
+  "description": "Live OC Transpo bus locations and arrivals as a route timeline.",
+  "start_url": "https://bus.jjjp.ca/",
+  "scope": "https://bus.jjjp.ca/",
+  "display": "standalone",
+  "background_color": "#0d0d0f",
+  "theme_color": "#0d0d0f",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
