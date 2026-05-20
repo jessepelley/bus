@@ -32,9 +32,11 @@ stop list comes from the bundled GTFS schedule (`data/gtfs-bus.json`).
 | `app.js`             | All app logic (timeline, departures board, map, nearby)  |
 | `styles.css`         | Styling                                                  |
 | `auth.js`            | Optional jjjp.ca login (not required to use the app)     |
+| `sw.js`              | Service worker — caches the app shell for fast/offline launch |
 | `data/gtfs-bus.json` | Bundled stop lists / shapes for the chosen routes        |
 | `build-data.py`      | Regenerates `data/gtfs-bus.json` from the GTFS export    |
-| `manifest.json` / `favicon.svg` | PWA metadata / icon                           |
+| `manifest.json`      | PWA metadata (installable app)                           |
+| `favicon.svg` / `icon*.png` / `apple-touch-icon.png` | App icons                |
 | `CNAME`              | GitHub Pages custom domain (`bus.jjjp.ca`)               |
 
 The matching NAS file `api.php` lives in this folder set at

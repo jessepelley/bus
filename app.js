@@ -6,32 +6,40 @@
 'use strict';
 
 // Production proxy. For local testing, set window.BUS_API_URL before app.js
-// loads (e.g. in the console or a small inline script) to point at a local
-// PHP server — api.php already allows the localhost origin.
+// loads to point at a local PHP server — api.php allows the localhost origin.
 const API_URL   = window.BUS_API_URL || 'https://jjjp.ca/bus/api.php';
 const DATA_URL  = 'data/gtfs-bus.json';
-const ROW_H     = 56;                       // px — must match --row-h in styles.css
 const PREFS_KEY = 'busjjjp.prefs';
 const STALE_VEHICLE = 150;                  // s — a bus older than this is "faded"
 
+const TILES = {
+  light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+  dark:  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+};
+const META_THEME = { light: '#ffffff', dark: '#16161a' };
+
 /* ── State ──────────────────────────────────────────────────────────────── */
-let GTFS        = null;                     // bundled schedule
+let GTFS        = null;
 let LINES       = new Map();                // "route:dir" -> line object
 let PATTERNS    = new Map();                // patternId -> pattern object
 let stopRoutes  = new Map();                // stopId -> Set of route short names
 
-let runs        = [];                       // active trips, rebuilt each poll
-let lastData    = null;                     // last realtime payload
-let lastPollClient = 0;                     // Date.now() of last successful poll
+let runs        = [];
+let lastData    = null;
+let lastPollClient = 0;
 let pollTimer   = null;
 let renderTimer = null;
-let map = null, mapLayers = null;           // Leaflet handles
+let map = null, mapLayers = null, tileLayer = null;
+const expandedCards = new Set();            // line keys shown as full timelines
 
 const prefs = {
-  lines:    ['45:1', '5:0'],                // route:dir keys shown as timelines
-  favStops: [],                             // stop ids on the departures board
+  lines:    ['45:1', '5:0'],
+  favStops: [],
   showMap:  false,
   refresh:  20,
+  theme:    'light',
+  compact:  true,
+  expanded: [],
 };
 
 /* ── Boot ───────────────────────────────────────────────────────────────── */
@@ -40,8 +48,11 @@ window.addEventListener('DOMContentLoaded', init);
 async function init() {
   auth.handleCallback();
   loadPrefs();
+  applyTheme(prefs.theme);
+  registerServiceWorker();
   wireChrome();
   renderAuth();
+  setSidebar(window.innerWidth > 760);
 
   try {
     const res = await fetch(DATA_URL);
@@ -57,9 +68,9 @@ async function init() {
   prepareGtfs();
   document.getElementById('data-date').textContent = GTFS.generated || '—';
 
-  // Drop preference lines that don't exist in this data build.
   prefs.lines = prefs.lines.filter(k => LINES.has(k));
   if (prefs.lines.length === 0) prefs.lines = [...LINES.keys()].slice(0, 2);
+  for (const k of prefs.expanded) if (LINES.has(k)) expandedCards.add(k);
 
   renderLinePicker();
   renderFavStops();
@@ -71,6 +82,13 @@ async function init() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) poll();
   });
+  window.addEventListener('resize', onResize);
+}
+
+function registerServiceWorker() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => { /* non-fatal */ });
+  }
 }
 
 /* ── Prepare bundled data ───────────────────────────────────────────────── */
@@ -83,7 +101,6 @@ function prepareGtfs() {
         stopRoutes.get(sid).add(route.short);
       }
     }
-    // A "line" = route + direction. Its timeline is the longest pattern.
     const byDir = {};
     for (const pat of route.patterns) {
       if (!byDir[pat.dir] || pat.stops.length > byDir[pat.dir].stops.length)
@@ -104,14 +121,30 @@ function prepareGtfs() {
 /* ── Preferences ────────────────────────────────────────────────────────── */
 function loadPrefs() {
   try {
-    const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}');
-    Object.assign(prefs, saved);
+    Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'));
   } catch (e) { /* keep defaults */ }
-  const sel = document.getElementById('refresh-select');
-  if (sel) sel.value = String(prefs.refresh);
+  document.getElementById('refresh-select').value = String(prefs.refresh);
+  document.getElementById('theme-select').value = prefs.theme;
+  document.getElementById('compact-toggle').checked = prefs.compact;
 }
 function savePrefs() {
+  prefs.expanded = [...expandedCards];
   localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+}
+
+/* ── Theme ──────────────────────────────────────────────────────────────── */
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const meta = document.getElementById('theme-color-meta');
+  if (meta) meta.content = META_THEME[theme] || META_THEME.light;
+  if (map && tileLayer) {
+    map.removeLayer(tileLayer);
+    tileLayer = L.tileLayer(TILES[theme], {
+      maxZoom: 20, subdomains: 'abcd',
+      attribution: '© OpenStreetMap, © CARTO',
+    }).addTo(map);
+    tileLayer.bringToBack();
+  }
 }
 
 /* ── Chrome / controls ──────────────────────────────────────────────────── */
@@ -119,7 +152,19 @@ function wireChrome() {
   document.getElementById('refresh-btn').onclick = () => poll();
 
   document.getElementById('sidebar-toggle').onclick = () =>
-    document.getElementById('sidebar').classList.toggle('collapsed');
+    setSidebar(document.getElementById('sidebar').classList.contains('collapsed'));
+  document.getElementById('backdrop').onclick = () => setSidebar(false);
+
+  document.getElementById('theme-select').onchange = (e) => {
+    prefs.theme = e.target.value; savePrefs(); applyTheme(prefs.theme);
+  };
+
+  document.getElementById('compact-toggle').onchange = (e) => {
+    prefs.compact = e.target.checked;
+    expandedCards.clear();
+    if (!prefs.compact) prefs.lines.forEach(k => expandedCards.add(k));
+    savePrefs(); renderTimelines();
+  };
 
   document.getElementById('map-toggle').onchange = (e) => {
     prefs.showMap = e.target.checked; savePrefs();
@@ -134,12 +179,26 @@ function wireChrome() {
   document.getElementById('nearby-btn').onclick = findNearby;
 }
 
+function setSidebar(open) {
+  document.getElementById('sidebar').classList.toggle('collapsed', !open);
+  document.getElementById('backdrop').classList.toggle('hidden', !open);
+}
+
+function onResize() {
+  if (window.innerWidth > 760) setSidebar(true);
+}
+
 function startTimers() {
   clearInterval(pollTimer);
   clearInterval(renderTimer);
   if (prefs.refresh > 0) pollTimer = setInterval(poll, prefs.refresh * 1000);
-  // Re-render between polls so the countdowns keep ticking down.
-  renderTimer = setInterval(renderAll, 15000);
+  renderTimer = setInterval(renderAll, 15000);   // keep countdowns ticking
+}
+
+/* px height of a timeline stop row — read from CSS so it stays in sync */
+function rowH() {
+  const v = getComputedStyle(document.documentElement).getPropertyValue('--row-h');
+  return parseFloat(v) || 56;
 }
 
 /* ── Realtime poll ──────────────────────────────────────────────────────── */
@@ -161,6 +220,7 @@ async function poll() {
   } catch (e) {
     console.error('poll failed', e);
     setFreshness('dead', 'proxy unreachable');
+    document.documentElement.classList.remove('live');
     toast('Could not reach the bus proxy — ' + e.message);
   } finally {
     btn.classList.remove('spinning');
@@ -178,28 +238,21 @@ function serverNow() {
 function buildRuns() {
   runs = [];
   const now = serverNow();
-
-  // Index vehicle GPS by trip id.
   const vehByTrip = new Map();
-  for (const v of lastData.vehicles || []) {
-    if (v.trip) vehByTrip.set(v.trip, v);
-  }
+  for (const v of lastData.vehicles || []) if (v.trip) vehByTrip.set(v.trip, v);
   const seenTrips = new Set();
 
   for (const tr of lastData.trips || []) {
     if (!tr.trip) continue;
     seenTrips.add(tr.trip);
-
     const lineKey = lineKeyForTrip(tr);
     const line = LINES.get(lineKey);
 
-    // Predicted arrival per stop id (use arrival, fall back to departure).
     const etas = new Map();
     for (const s of tr.stu || []) {
       const t = s.arr || s.dep;
       if (s.stop && t) etas.set(s.stop, t);
     }
-    // Next stop = first predicted stop still in the future.
     let nextStopId = null;
     for (const s of tr.stu || []) {
       const t = s.arr || s.dep;
@@ -210,7 +263,6 @@ function buildRuns() {
     runs.push(makeRun(tr, line, lineKey, etas, nextStopId, vehByTrip.get(tr.trip)));
   }
 
-  // Vehicles broadcasting a trip with no trip-update entry — GPS only.
   for (const v of lastData.vehicles || []) {
     if (!v.trip || seenTrips.has(v.trip)) continue;
     const lineKey = lineKeyForTrip(v);
@@ -231,11 +283,10 @@ function makeRun(tr, line, lineKey, etas, nextStopId, veh) {
   return {
     trip: tr.trip, lineKey, line,
     short: line ? line.short : tr.route,
-    color: line ? line.color : '#3b82f6',
+    color: line ? line.color : '#2563eb',
     headsign: line ? line.headsign : '',
     etas, nextStopId,
     vehicle: veh || null,
-    // GPS feed has the id; if there's no GPS row, the trip update carries it too.
     vehId: (veh && veh.id) || tr.vehicle || tr.id || '?',
     feedTs: tr.ts || (veh && veh.ts) || null,
   };
@@ -249,22 +300,20 @@ function renderAll() {
   if (prefs.showMap && map) renderMap();
 }
 
-/* ── Freshness pill ─────────────────────────────────────────────────────── */
+/* ── Freshness pill + live indicator ────────────────────────────────────── */
 function renderFreshness() {
   if (!lastData) return;
-  const feedTs = Math.min(lastData.vp_ts || 0, lastData.tu_ts || 0) ||
-                 lastData.vp_ts || lastData.tu_ts;
-  if (!feedTs) { setFreshness('stale', 'no feed timestamp'); return; }
-  const age = (serverNow() - feedTs);
+  const feedTs = Math.min(lastData.vp_ts || Infinity, lastData.tu_ts || Infinity);
+  if (!isFinite(feedTs)) { setFreshness('stale', 'no feed timestamp'); return; }
+  const age = serverNow() - feedTs;
   let cls = 'fresh';
   if (age > 180) cls = 'dead';
   else if (age > 75) cls = 'stale';
-  const label = lastData.stale ? 'feed stale · ' : '';
-  setFreshness(cls, `${label}data ${fmtAgo(age)}`);
+  setFreshness(cls, (lastData.stale ? 'feed stale · ' : '') + 'data ' + fmtAgo(age));
+  document.documentElement.classList.toggle('live', cls === 'fresh');
 }
 function setFreshness(cls, text) {
-  const pill = document.getElementById('freshness');
-  pill.className = 'pill ' + cls;
+  document.getElementById('freshness').className = 'pill ' + cls;
   document.getElementById('freshness-text').textContent = text;
 }
 
@@ -278,13 +327,10 @@ function renderDeparturesBoard() {
     const stop = GTFS.stops[sid];
     if (!stop) continue;
 
-    // Every run with a future prediction for this stop.
     const arrivals = [];
     for (const run of runs) {
       const t = run.etas.get(sid);
-      if (t && t > now - 30) {
-        arrivals.push({ run, t, mins: (t - now) / 60 });
-      }
+      if (t && t > now - 30) arrivals.push({ run, t, mins: (t - now) / 60 });
     }
     arrivals.sort((a, b) => a.t - b.t);
 
@@ -292,18 +338,13 @@ function renderDeparturesBoard() {
     card.className = 'dep-card';
     if (arrivals.length && arrivals[0].mins <= 6) card.classList.add('urgent');
 
-    let rows = '';
-    if (arrivals.length === 0) {
-      rows = `<div class="dep-none">No live arrivals right now.</div>`;
-    } else {
-      for (const a of arrivals.slice(0, 4)) {
-        rows += `<div class="dep-row">
+    let rows = arrivals.length === 0
+      ? `<div class="dep-none">No live arrivals right now.</div>`
+      : arrivals.slice(0, 4).map(a => `<div class="dep-row">
           ${badge(a.run)}
           <span class="headsign">${esc(a.run.headsign)}</span>
-          ${etaBig(a.t, now)}
-        </div>`;
-      }
-    }
+          ${etaBig(a.t, now)}</div>`).join('');
+
     card.innerHTML = `
       <div class="dep-head">
         <span class="stop-name">${esc(stop.name)}</span>
@@ -318,48 +359,122 @@ function renderDeparturesBoard() {
 function renderTimelines() {
   const host = document.getElementById('timelines');
   host.innerHTML = '';
-  const empty = document.getElementById('empty-state');
-  empty.classList.toggle('hidden', prefs.lines.length > 0);
-
+  document.getElementById('empty-state')
+    .classList.toggle('hidden', prefs.lines.length > 0);
   for (const key of prefs.lines) {
     const line = LINES.get(key);
-    if (line) host.appendChild(buildTimeline(line));
+    if (line) host.appendChild(buildTimelineCard(line));
   }
 }
 
-function buildTimeline(line) {
+function buildTimelineCard(line) {
   const now = serverNow();
-  const stops = line.pattern.stops;
   const lineRuns = runs.filter(r => r.lineKey === line.key);
+  const expanded = expandedCards.has(line.key);
 
   const card = document.createElement('div');
-  card.className = 'timeline-card';
+  card.className = 'timeline-card' + (expanded ? ' expanded' : '');
 
-  card.innerHTML = `
-    <div class="timeline-head">
-      <span class="route-badge" style="background:${line.color};color:${line.text}">
-        ${esc(line.short)}</span>
-      <span class="tl-title">→ ${esc(line.headsign)}</span>
-      <span class="tl-sub">${lineRuns.length} bus${lineRuns.length === 1 ? '' : 'es'}
-        · ${stops.length} stops</span>
-    </div>`;
+  const head = document.createElement('div');
+  head.className = 'timeline-head';
+  head.innerHTML = `
+    <span class="tl-chevron">▶</span>
+    <span class="route-badge" style="background:${line.color};color:${line.text}">
+      ${esc(line.short)}</span>
+    <span class="tl-title">→ ${esc(line.headsign)}</span>
+    <span class="tl-sub">${lineRuns.length} bus${lineRuns.length === 1 ? '' : 'es'}
+      · ${line.pattern.stops.length} stops · tap to
+      ${expanded ? 'collapse' : 'expand'}</span>`;
+  head.onclick = () => {
+    if (expandedCards.has(line.key)) expandedCards.delete(line.key);
+    else expandedCards.add(line.key);
+    savePrefs(); renderTimelines();
+  };
+  card.appendChild(head);
 
+  card.appendChild(expanded
+    ? buildFullBody(line, lineRuns, now)
+    : buildCompactBody(line, lineRuns, now));
+  return card;
+}
+
+/* ── Compact body — bus-style strips ────────────────────────────────────── */
+function buildCompactBody(line, lineRuns, now) {
+  const body = document.createElement('div');
+  body.className = 'compact-body';
+  if (lineRuns.length === 0) {
+    body.innerHTML = `<div class="tl-empty">No buses currently running
+      this direction.</div>`;
+    return body;
+  }
+  // Soonest buses first.
+  const ordered = lineRuns.slice().sort((a, b) => {
+    const ta = a.nextStopId ? a.etas.get(a.nextStopId) : Infinity;
+    const tb = b.nextStopId ? b.etas.get(b.nextStopId) : Infinity;
+    return (ta || Infinity) - (tb || Infinity);
+  });
+  for (const run of ordered) body.appendChild(buildBusStrip(run, line, now));
+  return body;
+}
+
+function buildBusStrip(run, line, now) {
+  const stops = line.pattern.stops;
+  let nextIdx = run.nextStopId ? stops.indexOf(run.nextStopId) : -1;
+  if (nextIdx < 0 && run.vehicle && run.vehicle.lat != null)
+    nextIdx = nearestStopIndex(stops, run.vehicle.lat, run.vehicle.lon);
+
+  const strip = document.createElement('div');
+  strip.className = 'bus-strip';
+  const old = run.feedTs && (now - run.feedTs > STALE_VEHICLE);
+
+  if (nextIdx < 0) {
+    strip.innerHTML = `${badge(run)}
+      <span class="strip-stops"><span class="from">Location unknown</span></span>
+      <span class="strip-veh">#${esc(run.vehId)}</span>`;
+    return strip;
+  }
+
+  const lastIdx = stops.length - 1;
+  const stopName = i => esc((GTFS.stops[stops[i]] || {}).name || stops[i]);
+  const fromTxt  = nextIdx > 0 ? `<span class="from">${stopName(nextIdx - 1)}</span>
+    <span class="strip-arrow">›</span>` : '';
+  const atTerm   = nextIdx >= lastIdx;
+  const moreDots = (nextIdx < lastIdx - 1)
+    ? `<span class="strip-more">··</span>` : '';
+  const termTxt  = atTerm ? '' :
+    `${moreDots}<span class="term">${stopName(lastIdx)}</span>`;
+
+  const eta = run.nextStopId ? run.etas.get(run.nextStopId) : null;
+  const etaSec = eta ? eta - now : null;
+  const etaCls = etaSec == null ? '' : (etaSec < 45 ? 'now' : (etaSec < 360 ? 'soon' : ''));
+
+  strip.innerHTML = `
+    ${badge(run)}
+    ${old ? '' : '<span class="live-dot"></span>'}
+    <span class="strip-stops">
+      ${fromTxt}
+      <span class="to">${stopName(nextIdx)}</span>
+      ${termTxt}
+    </span>
+    <span class="strip-veh">#${esc(run.vehId)}</span>
+    <span class="strip-eta ${etaCls}">${eta ? fmtEta(etaSec) : '—'}</span>`;
+  return strip;
+}
+
+/* ── Full body — rail + every stop ──────────────────────────────────────── */
+function buildFullBody(line, lineRuns, now) {
+  const stops = line.pattern.stops;
+  const H = rowH();
   const body = document.createElement('div');
   body.className = 'timeline-body';
   body.innerHTML = `<div class="rail"></div>`;
 
-  // Stop rows.
   stops.forEach((sid, i) => {
     const stop = GTFS.stops[sid] || { name: sid, code: '?' };
     const isFav = prefs.favStops.includes(sid);
     const terminus = (i === 0 || i === stops.length - 1);
-
-    // ETAs at this stop, soonest first.
-    const etas = lineRuns
-      .map(r => r.etas.get(sid))
-      .filter(t => t && t > now - 30)
-      .sort((a, b) => a - b)
-      .slice(0, 3);
+    const etas = lineRuns.map(r => r.etas.get(sid))
+      .filter(t => t && t > now - 30).sort((a, b) => a - b).slice(0, 3);
 
     const row = document.createElement('div');
     row.className = 'stop-row' + (isFav ? ' is-fav' : '') +
@@ -376,38 +491,31 @@ function buildTimeline(line) {
         ${etas.map(t => etaChip(t, now)).join('') ||
           '<span class="stop-meta">—</span>'}
       </div>
-      <button class="fav-toggle ${isFav ? 'on' : ''}" title="Favourite this stop">★</button>`;
+      <button class="fav-toggle ${isFav ? 'on' : ''}"
+              title="Favourite this stop">★</button>`;
     row.querySelector('.fav-toggle').onclick = () => toggleFav(sid);
     body.appendChild(row);
   });
 
-  // Bus markers floating on the rail.
   for (const run of lineRuns) {
-    const marker = buildBusMarker(run, stops, now);
+    const marker = buildBusMarker(run, stops, now, H);
     if (marker) body.appendChild(marker);
   }
-
   if (lineRuns.length === 0) {
     const note = document.createElement('div');
     note.className = 'tl-empty';
     note.textContent = 'No buses currently running this direction.';
     body.appendChild(note);
   }
-
-  card.appendChild(body);
-  return card;
+  return body;
 }
 
-function buildBusMarker(run, stops, now) {
+function buildBusMarker(run, stops, now, H) {
   let nextIdx = run.nextStopId ? stops.indexOf(run.nextStopId) : -1;
-
-  // No prediction — fall back to the GPS-nearest stop.
-  if (nextIdx < 0 && run.vehicle && run.vehicle.lat != null) {
+  if (nextIdx < 0 && run.vehicle && run.vehicle.lat != null)
     nextIdx = nearestStopIndex(stops, run.vehicle.lat, run.vehicle.lon);
-  }
   if (nextIdx < 0) return null;
 
-  // Fractional position between the previous stop and the next one.
   let frac = 0.55;
   const prevIdx = Math.max(0, nextIdx - 1);
   if (run.vehicle && run.vehicle.lat != null && nextIdx > 0) {
@@ -418,12 +526,8 @@ function buildBusMarker(run, stops, now) {
       if (dA + dB > 0) frac = Math.min(0.95, Math.max(0.05, dA / (dA + dB)));
     }
   }
-  const idxFloat = Math.max(0, prevIdx + frac);
-  const top = idxFloat * ROW_H + ROW_H / 2;
-
+  const top = Math.max(0, prevIdx + frac) * H + H / 2;
   const eta = run.nextStopId ? run.etas.get(run.nextStopId) : null;
-  const etaTxt = eta ? fmtEta(eta - now) : 'tracking';
-  const vehId = run.vehId;
   const old = run.feedTs && (now - run.feedTs > STALE_VEHICLE);
 
   const m = document.createElement('div');
@@ -432,7 +536,8 @@ function buildBusMarker(run, stops, now) {
   m.innerHTML = `
     <div class="bus-dot" style="background:${run.color}">🚌</div>
     <div class="bus-info">
-      <span class="veh">#${esc(vehId)}</span> · ${esc(etaTxt)}
+      <span class="veh">#${esc(run.vehId)}</span> ·
+      ${eta ? esc(fmtEta(eta - now)) : 'tracking'}
       ${occDot(run.vehicle && run.vehicle.occ)}
     </div>`;
   return m;
@@ -444,12 +549,13 @@ async function enableMap() {
   if (!map) {
     await loadLeaflet();
     map = L.map('map', { zoomControl: true }).setView([45.402, -75.642], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '© OpenStreetMap',
+    tileLayer = L.tileLayer(TILES[prefs.theme] || TILES.light, {
+      maxZoom: 20, subdomains: 'abcd',
+      attribution: '© OpenStreetMap, © CARTO',
     }).addTo(map);
     mapLayers = { shapes: L.layerGroup().addTo(map),
-                  stops: L.layerGroup().addTo(map),
-                  buses: L.layerGroup().addTo(map) };
+                  stops:  L.layerGroup().addTo(map),
+                  buses:  L.layerGroup().addTo(map) };
   }
   drawMapStatic();
   renderMap();
@@ -487,7 +593,7 @@ function drawMapStatic() {
       if (!s) continue;
       L.circleMarker([s.lat, s.lon], {
         radius: 5, color: line.color, weight: 2,
-        fillColor: '#16161a', fillOpacity: 1,
+        fillColor: '#fff', fillOpacity: 1,
       }).bindPopup(`<strong>${esc(s.name)}</strong><br>Stop #${esc(s.code)}`)
         .addTo(mapLayers.stops);
     }
@@ -528,12 +634,14 @@ function renderLinePicker() {
       <input type="checkbox" ${prefs.lines.includes(line.key) ? 'checked' : ''}>
       <span class="route-badge" style="background:${line.color};color:${line.text}">
         ${esc(line.short)}</span>
-      <span><span class="ln-name">→ ${esc(line.headsign)}</span></span>`;
+      <span class="ln-name">→ ${esc(line.headsign)}</span>`;
     lbl.querySelector('input').onchange = (e) => {
       if (e.target.checked) {
         if (!prefs.lines.includes(line.key)) prefs.lines.push(line.key);
+        if (!prefs.compact) expandedCards.add(line.key);
       } else {
         prefs.lines = prefs.lines.filter(k => k !== line.key);
+        expandedCards.delete(line.key);
       }
       savePrefs();
       renderTimelines();
@@ -548,8 +656,8 @@ function renderFavStops() {
   const host = document.getElementById('fav-stops');
   host.innerHTML = '';
   if (prefs.favStops.length === 0) {
-    host.innerHTML = `<div class="empty-mini">None yet — tap ★ on any stop,
-      or use “Find stops near me”.</div>`;
+    host.innerHTML = `<div class="empty-mini">None yet — tap ★ on any stop in
+      an expanded timeline, or use “Find stops near me”.</div>`;
     return;
   }
   for (const sid of prefs.favStops) {
@@ -567,11 +675,10 @@ function renderFavStops() {
 }
 
 function toggleFav(sid) {
-  if (prefs.favStops.includes(sid)) {
+  if (prefs.favStops.includes(sid))
     prefs.favStops = prefs.favStops.filter(s => s !== sid);
-  } else {
+  else
     prefs.favStops.push(sid);
-  }
   savePrefs();
   renderFavStops();
   renderDeparturesBoard();
@@ -619,9 +726,7 @@ async function renderAuth() {
   if (auth.isAuthenticated()) {
     host.innerHTML = `<div class="auth-user">Signed in
       <button class="link-btn" id="logout-btn">log out</button></div>`;
-    document.getElementById('logout-btn').onclick = () => {
-      auth.logout(); renderAuth();
-    };
+    document.getElementById('logout-btn').onclick = () => { auth.logout(); renderAuth(); };
     const user = await auth.whoami();
     if (user && (user.given_name || user.name)) {
       host.querySelector('.auth-user').firstChild.textContent =
@@ -656,13 +761,11 @@ function haversine(la1, lo1, la2, lo2) {
 
 function fmtEta(sec) {
   if (sec < 45) return 'due';
-  const m = Math.round(sec / 60);
-  return m + ' min';
+  return Math.round(sec / 60) + ' min';
 }
 function fmtAgo(sec) {
   sec = Math.max(0, Math.round(sec));
-  if (sec < 60) return sec + 's ago';
-  return Math.round(sec / 60) + 'm ago';
+  return sec < 60 ? sec + 's ago' : Math.round(sec / 60) + 'm ago';
 }
 function fmtDist(m) {
   return m < 1000 ? Math.round(m) + ' m' : (m / 1000).toFixed(1) + ' km';
@@ -671,7 +774,6 @@ function fmtClock(unix) {
   return new Date(unix * 1000).toLocaleTimeString([],
     { hour: 'numeric', minute: '2-digit' });
 }
-
 function etaClass(sec) {
   if (sec < 45) return 'now';
   if (sec < 6 * 60) return 'soon';
@@ -696,7 +798,6 @@ function occDot(occ) {
   const cls = occ <= 1 ? 'occ-1' : (occ <= 3 ? 'occ-2' : 'occ-3');
   return `<span class="occ-dot ${cls}" title="Occupancy"></span>`;
 }
-
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"]/g,
     c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));

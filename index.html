@@ -2,17 +2,21 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>OC Transpo Live — Bus Timeline</title>
 <meta name="description" content="Live OC Transpo bus locations and arrival times as a route timeline.">
-<meta name="theme-color" content="#0d0d0f">
+<meta name="theme-color" content="#ffffff" id="theme-color-meta">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Bus Live">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="manifest" href="manifest.json">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
 <header id="topbar">
+  <button id="sidebar-toggle" class="icon-btn" title="Menu">☰</button>
   <div class="brand">
     <span class="brand-mark">🚌</span>
     <span class="brand-text">OC Transpo <strong>Live</strong></span>
@@ -21,7 +25,6 @@
     <span class="pill-dot"></span><span id="freshness-text">connecting…</span>
   </div>
   <button id="refresh-btn" class="icon-btn" title="Refresh now">⟳</button>
-  <button id="sidebar-toggle" class="icon-btn" title="Show / hide panel">☰</button>
 </header>
 
 <main id="layout">
@@ -30,21 +33,32 @@
 
     <section class="panel">
       <h2>Lines</h2>
-      <p class="hint">Pick the routes &amp; directions to show as timelines.</p>
-      <div id="line-picker" class="line-picker"><!-- built by app.js --></div>
+      <p class="hint">Pick the routes &amp; directions to show.</p>
+      <div id="line-picker" class="line-picker"></div>
     </section>
 
     <section class="panel">
       <h2>My stops</h2>
       <p class="hint">Favourited stops get a big arrivals card up top — your
         “rush or relax?” glance.</p>
-      <div id="fav-stops" class="fav-stops"><!-- built by app.js --></div>
+      <div id="fav-stops" class="fav-stops"></div>
       <button id="nearby-btn" class="wide-btn">📍 Find stops near me</button>
       <div id="nearby-list" class="nearby-list"></div>
     </section>
 
     <section class="panel">
       <h2>Display</h2>
+      <label class="row-field">
+        <span>Theme</span>
+        <select id="theme-select">
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+      <label class="row-toggle">
+        <input type="checkbox" id="compact-toggle">
+        <span>Compact timelines</span>
+      </label>
       <label class="row-toggle">
         <input type="checkbox" id="map-toggle">
         <span>Show live map</span>
@@ -63,7 +77,7 @@
 
     <section class="panel panel-quiet">
       <h2>Account</h2>
-      <div id="auth-area"><!-- built by app.js --></div>
+      <div id="auth-area"></div>
     </section>
 
     <p class="credits">
@@ -75,9 +89,9 @@
   </aside>
 
   <section id="content">
-    <div id="departures-board"><!-- big favourite-stop cards --></div>
+    <div id="departures-board"></div>
     <div id="map-wrap" class="hidden"><div id="map"></div></div>
-    <div id="timelines"><!-- route timelines --></div>
+    <div id="timelines"></div>
     <div id="empty-state" class="empty-state hidden">
       No lines selected — pick one or more under <strong>Lines</strong>.
     </div>
@@ -85,6 +99,7 @@
 
 </main>
 
+<div id="backdrop" class="hidden"></div>
 <div id="toast" class="toast hidden"></div>
 
 <script src="auth.js"></script>
