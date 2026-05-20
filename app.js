@@ -29,6 +29,8 @@ let lastData    = null;
 let lastPollClient = 0;
 let pollTimer   = null;
 let renderTimer = null;
+let statsTimer  = null;
+let statsByRoute = {};                      // routeId -> reliability stats
 let map = null, mapLayers = null, tileLayer = null;
 const expandedCards = new Set();            // line keys shown as full timelines
 
@@ -78,11 +80,28 @@ async function init() {
 
   await poll();
   startTimers();
+  pollStats();
+  statsTimer = setInterval(pollStats, 300000);   // reliability changes slowly
 
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) poll();
   });
   window.addEventListener('resize', onResize);
+}
+
+/* ── Reliability stats ──────────────────────────────────────────────────── */
+async function pollStats() {
+  const routes = [...new Set(
+    prefs.lines.map(k => LINES.get(k)).filter(Boolean).map(l => l.routeId))];
+  const headers = {};
+  if (auth.isAuthenticated()) headers['X-API-Key'] = auth.getToken();
+  for (const route of routes) {
+    try {
+      const res = await fetch(`${API_URL}?action=stats&route=${route}&days=7`, { headers });
+      if (res.ok) statsByRoute[route] = await res.json();
+    } catch (e) { /* stats are optional — ignore */ }
+  }
+  renderTimelines();
 }
 
 function registerServiceWorker() {
@@ -392,10 +411,55 @@ function buildTimelineCard(line) {
   };
   card.appendChild(head);
 
+  const strip = buildReliabilityStrip(line.routeId);
+  if (strip) card.appendChild(strip);
+
   card.appendChild(expanded
     ? buildFullBody(line, lineRuns, now)
     : buildCompactBody(line, lineRuns, now));
   return card;
+}
+
+/* A per-route reliability summary. Hidden entirely if the collector hasn't
+   been set up (stats endpoint reports unavailable). */
+function buildReliabilityStrip(routeId) {
+  const s = statsByRoute[routeId];
+  if (!s || !s.available) return null;
+
+  const today = (s.by_day && s.by_day[0]) || null;
+  const parts = [];
+  let otp = null;
+  if (today && today.measured > 0) {
+    otp = today.on_time_pct;
+    parts.push(`${otp}% on time today`);
+    if (today.avg_delay_sec != null) parts.push('avg ' + fmtDelay(today.avg_delay_sec));
+  } else {
+    parts.push('today: collecting…');
+  }
+  if (today && today.scheduled > 0) parts.push(`${today.observed}/${today.scheduled} trips ran`);
+  if (s.days > 1 && s.measured > 0) parts.push(`7-day ${s.on_time_pct}%`);
+
+  const grade = otp != null ? otp : s.on_time_pct;
+  const dotCls = grade == null ? 'ok' : (grade >= 90 ? 'good' : grade >= 75 ? 'ok' : 'bad');
+
+  const el = document.createElement('div');
+  el.className = 'reliability';
+  const mf = s.monitored_from;
+  el.title = 'On-time = within −1 to +5 min of schedule, estimated from '
+    + 'predicted arrivals. Cancellations are inferred — OC Transpo publishes '
+    + 'no official cancellation signal. '
+    + (mf ? 'Monitored since ' + fmtClock(mf) + '.' : 'Not monitored yet today.');
+
+  let html = `<span class="rel-dot ${dotCls}"></span>`
+           + `<span class="rel-text">${esc(parts.join(' · '))}`;
+  if (today && today.missed > 0)
+    html += ` · <span class="rel-miss">${today.missed} missed</span>`;
+  html += '</span>';
+  if (s.collector && !s.collector.healthy)
+    html += '<span class="rel-warn" title="Collector has not reported recently">'
+          + '⚠ collector offline</span>';
+  el.innerHTML = html;
+  return el;
 }
 
 /* ── Compact body — bus-style strips ────────────────────────────────────── */
@@ -762,6 +826,12 @@ function haversine(la1, lo1, la2, lo2) {
 function fmtEta(sec) {
   if (sec < 45) return 'due';
   return Math.round(sec / 60) + ' min';
+}
+function fmtDelay(sec) {
+  if (sec == null) return '—';
+  if (sec > -60 && sec < 60) return 'on time';
+  const m = Math.round(sec / 60);
+  return (m > 0 ? '+' : '') + m + ' min';
 }
 function fmtAgo(sec) {
   sec = Math.max(0, Math.round(sec));
