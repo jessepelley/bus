@@ -6,59 +6,85 @@ as a **start-to-end route timeline**, with a **compact bus-style view**, a
 Built for a desktop browser — the "do I need to rush for my bus?" glance at
 the end of a shift — but fully responsive and installable as a PWA.
 
-Default view: **Route 45 → Rideau** and **Route 5 → Waller (downtown)**,
-both passing the Ottawa Hospital – General Campus. Any route in the bundled
-schedule can be shown; preferences are saved per browser in `localStorage`.
+**Every OC Transpo route is available.** Search the route picker by number or
+destination and tick the directions you want; preferences are saved per
+browser in `localStorage`. The default view is **Route 45 → Rideau** and
+**Route 5 → Waller (downtown)**, both passing the Ottawa Hospital – General
+Campus.
 
 ## How it works
 
 ```
-bus.jjjp.ca (GitHub Pages, static)     jjjp.ca/bus/  (Synology NAS, PHP)
-┌──────────────────────────────┐       ┌──────────────────────────────────┐
-│ index.html / app.js / css    │       │ bus_lib.php  shared config + key  │
-│ data/gtfs-bus.json (schedule) │ fetch │ api.php      realtime + stats     │
-│ timeline / compact / map      │ ────> │ collect.php  reliability sampler  │
-│ reliability strips            │ <──── │ schedule.json / bus-stats.db      │
-└──────────────────────────────┘  JSON └──────────────────────────────────┘
-                                          ▲ Task Scheduler runs collect.php
+bus.jjjp.ca (GitHub Pages, static)      jjjp.ca/bus/  (Synology NAS, PHP)
+┌───────────────────────────────┐       ┌─────────────────────────────────┐
+│ index.html / app.js / css     │       │ bus_lib.php  config + key + DB   │
+│ data/index.json   (all routes)│ fetch │ api.php      realtime + stats    │
+│ data/stops.json   (all stops) │ ────> │ schedule-meta.json  (calendar)   │
+│ data/routes/<id>.json (lazy)  │ <──── │ schedule/<id>.json  (per route)  │
+│ timeline / compact / map      │  JSON │ bus-stats.db  reliability data   │
+└───────────────────────────────┘       └─────────────────────────────────┘
 ```
 
 The API key must **never** ship in the static site, so the NAS holds it. The
 realtime feeds only report *upcoming* stops, so the full start-to-end stop
-list comes from the bundled GTFS schedule (`data/gtfs-bus.json`).
+list comes from the bundled GTFS schedule.
 
-`collect.php`, run every minute by the Synology Task Scheduler, is the
-**single upstream client**: it refreshes the feed cache that `api.php` serves
-from, so no matter how many people open the app, OC Transpo sees only the
-collector's steady ~2 requests/minute.
+**There is no cron job.** `api.php` fetches the OC Transpo feeds when visitors
+use the app and caches each feed for `CACHE_TTL` seconds (`bus_lib.php`), so a
+burst of concurrent visitors still produces only ~one upstream fetch per feed.
+Reliability data is recorded from that same visitor traffic — it is gathered
+*while people are using the app*, not around the clock.
+
+### Per-route data, loaded on demand
+
+OC Transpo has ~190 routes. Bundling every route's stop lists, shapes and
+trip→pattern map into one file would make a multi-megabyte download. Instead
+`build-data.py` emits:
+
+- `data/index.json` — every route's name, colour and per-direction headsign.
+  Small; loaded once at launch to populate the route picker.
+- `data/stops.json` — every stop (id → code/name/lat/lon + serving routes).
+  Shared by all routes; powers "find stops near me".
+- `data/routes/<id>.json` — one file per route with that route's stop lists,
+  shapes and trip→pattern map. The app fetches a route file **only when that
+  route is shown**, so it stays light no matter how many routes exist.
+
+The NAS schedule is split the same way: `schedule-meta.json` (the shared GTFS
+calendar) plus `schedule/<id>.json` per route, so a stats request only ever
+decodes one small route file.
+
+Routes are keyed throughout by their **short name** (`5`, `45`) — that is what
+the GTFS-Realtime feed uses to identify a route.
 
 ## Repository contents
 
-| File                 | Purpose                                                  |
-|----------------------|----------------------------------------------------------|
-| `index.html`         | App shell                                                |
-| `app.js`             | App logic (timeline, compact view, map, nearby, stats)   |
-| `styles.css`         | Styling (light default, dark theme)                      |
-| `auth.js`            | Optional jjjp.ca login (not required to use the app)     |
-| `sw.js`              | Service worker — app-shell cache for fast/offline launch |
-| `data/gtfs-bus.json` | Bundled stop lists / shapes for the chosen routes        |
-| `build-data.py`      | Regenerates `data/gtfs-bus.json` **and** `schedule.json` |
-| `manifest.json` / `favicon.svg` / `icon*.png` | PWA metadata + icons            |
-| `CNAME`              | GitHub Pages custom domain (`bus.jjjp.ca`)               |
+| File                  | Purpose                                                 |
+|-----------------------|---------------------------------------------------------|
+| `index.html`          | App shell                                               |
+| `app.js`              | App logic (timeline, compact view, map, nearby, stats)  |
+| `styles.css`          | Styling (light default, dark theme)                     |
+| `auth.js`             | Optional jjjp.ca login (not required to use the app)    |
+| `sw.js`               | Service worker — app-shell cache for fast/offline launch|
+| `data/index.json`     | All routes — light metadata for the route picker        |
+| `data/stops.json`     | All stops — shared by every route                       |
+| `data/routes/<id>.json` | Per-route stop lists / shapes (loaded on demand)      |
+| `build-data.py`       | Regenerates `data/` **and** the NAS schedule files      |
+| `manifest.json` / `favicon.svg` / `icon*.png` | PWA metadata + icons           |
+| `CNAME`               | GitHub Pages custom domain (`bus.jjjp.ca`)              |
 
 NAS-side files (in the `jjjp.ca/bus/` folder of this delivery):
 
-| File          | Purpose                                                         |
-|---------------|-----------------------------------------------------------------|
-| `bus_lib.php` | Shared config (API key, paths) + feed-fetch + DB helpers        |
-| `api.php`     | Live proxy: `realtime`, `stats`, `ping` endpoints                |
-| `collect.php` | Reliability collector — run on a schedule by Task Scheduler     |
-| `schedule.json` | Scheduled arrival times — generated by `build-data.py`, copied here |
+| File                  | Purpose                                                 |
+|-----------------------|---------------------------------------------------------|
+| `bus_lib.php`         | Shared config (API key, paths) + feed-fetch + DB helpers|
+| `api.php`             | Live proxy: `realtime`, `stats`, `ping` endpoints       |
+| `schedule-meta.json`  | GTFS calendar (service days) — generated by `build-data.py` |
+| `schedule/<id>.json`  | Per-route scheduled arrival times — generated by `build-data.py` |
 
 ## Deploy — static site (GitHub Pages)
 
-1. Push everything in this `bus.jjjp.ca/` folder to a repo (`schedule.json`
-   is `.gitignore`d — it is a NAS file, not part of the site).
+1. Push everything in this `bus.jjjp.ca/` folder to a repo. `schedule-meta.json`
+   and `schedule/` are `.gitignore`d — they are NAS files, not part of the site.
 2. Repo **Settings → Pages** → deploy from the default branch, root.
 3. `CNAME` already sets the domain. Add DNS: `bus` → `CNAME` →
    `<your-github-user>.github.io`.
@@ -66,46 +92,42 @@ NAS-side files (in the `jjjp.ca/bus/` folder of this delivery):
 
 ## Deploy — NAS proxy
 
-1. Copy `bus_lib.php`, `api.php` and `collect.php` into the same folder,
-   served at `https://jjjp.ca/bus/`.
-2. In `bus_lib.php`, confirm `OCT_KEY` is your OC Transpo subscription key
+1. Copy `bus_lib.php` and `api.php` into the same folder, served at
+   `https://jjjp.ca/bus/`.
+2. Copy `schedule-meta.json` and the whole `schedule/` folder beside them
+   (these come from `build-data.py` — see below). They power the reliability
+   stats; without them the app still works, it just shows no stats.
+3. In `bus_lib.php`, confirm `OCT_KEY` is your OC Transpo subscription key
    (already set).
-3. Make sure the folder is writable — the scripts create `.cache/` (feed
-   cache) and `bus-stats.db` (reliability data) beside themselves.
-4. Test: `https://jjjp.ca/bus/api.php?action=ping` → `{"ok":true,...}`.
+4. Make sure the folder is writable — `api.php` creates `.cache/` (feed cache)
+   and `bus-stats.db` (reliability data) beside itself.
+5. Test: `https://jjjp.ca/bus/api.php?action=ping` → `{"ok":true,...}`.
 
 CORS is locked to `https://bus.jjjp.ca` (plus `localhost:8000` for dev) —
 see `$GLOBALS['BUS_ALLOWED_ORIGINS']` in `bus_lib.php`.
 
-## Set up reliability tracking
+## How reliability tracking works
 
-This is what powers the "92% on time today · 18/19 trips ran" strips.
+This is what powers the "92% on time today · 18/19 trips ran" strips — and it
+needs **no setup and no cron job**.
 
-1. **Copy `schedule.json` to the NAS** — into `jjjp.ca/bus/` (regenerated by
-   `build-data.py`; see below). The collector needs it to know scheduled
-   times and which trips were due.
-2. **Synology Task Scheduler** → *Create → Scheduled Task → User-defined
-   script*:
-   - **User:** the web user (e.g. `http`), so the DB is writable by the web
-     server too.
-   - **Schedule:** daily, and under *repeat* choose **every 1 minute**.
-   - **Run command:**
-     ```
-     php /volume1/web/jjjp.ca/bus/collect.php
-     ```
-     Adjust the path, and use your installed PHP CLI binary if `php` is not
-     on `PATH` (e.g. `/usr/local/bin/php82`).
-3. Let it run a few minutes, then check
-   `https://jjjp.ca/bus/api.php?action=stats&route=45` — once trips start
-   completing it returns on-time numbers, and the app shows the strips.
+Every `realtime` request `api.php` serves does three things: fetch the feeds
+(or serve the brief shared cache), return them to the visitor, and then record
+a reliability sample from the same data. For each trip/stop it stores the
+latest predicted arrival; once a bus passes a stop that value stops changing,
+so it approximates the actual arrival time. A per-minute heartbeat records when
+the app was in use.
 
-Stats are honest about their limits:
-- **On-time** = a stop arrival within −1 to +5 min of schedule, estimated
-  from the *last predicted arrival* before the bus passed.
-- **Cancellations are inferred** — a scheduled trip that never appeared in
-  the feed. OC Transpo publishes no official cancellation signal, and the
-  app only judges trips during minutes the collector was actually running
-  ("monitored since…" in the strip tooltip).
+Because the data comes from real visitor traffic, the stats describe the times
+the app was actually being used:
+
+- **On-time** = a stop arrival within −1 to +5 min of schedule, estimated from
+  the *last predicted arrival* before the bus passed.
+- **Cancellations are inferred** — a scheduled trip that never appeared in the
+  feed. OC Transpo publishes no official cancellation signal, and a trip is
+  only judged ran/missed if the app was in use continuously around its
+  scheduled time ("watched since…" in the strip tooltip). A quiet stretch with
+  no visitors simply isn't counted, rather than being misread as cancellations.
 
 ### Is this within OC Transpo's terms?
 
@@ -113,35 +135,33 @@ The developer Terms of Use grant a revocable licence and prohibit
 *"interfering or disrupting"* City servers, but publish **no explicit numeric
 rate limit**. This design is deliberately courteous:
 
-- The collector makes **~2 requests/minute** (one per feed) — slower than the
-  feed itself updates (~every 20–30 s), so you are not even consuming every
-  update.
-- Because the collector refreshes the cache `api.php` serves from
-  (`CACHE_TTL` in `bus_lib.php` is set just above the 1-minute interval), the
-  live app adds **no extra upstream calls** — usage is fixed regardless of
-  how many people use it.
-- To be cautious you can run the collector every 5 minutes instead: raise
-  `CACHE_TTL` to ~320 and set the Task Scheduler repeat to 5 minutes.
+- `api.php` caches each feed for `CACHE_TTL` seconds (default 30). Concurrent
+  visitors share that cache, so upstream traffic is **roughly one fetch per
+  feed per `CACHE_TTL`** while the app is in use — about 2 requests/minute at
+  most, regardless of how many people are on it.
+- When **nobody is using the app, there are zero upstream calls.** Usage
+  scales down to nothing instead of running a 24/7 collector.
+- To be even more conservative, raise `CACHE_TTL` in `bus_lib.php`.
 
 If in doubt, the portal lists **octranspo-dev@ottawa.ca** for questions.
 
 ## Refresh the schedule (~monthly)
 
-OC Transpo republishes its GTFS schedule roughly monthly. **This build
-expires 2026-06-08** (the feed's `feed_end_date`). To refresh:
+OC Transpo republishes its GTFS schedule roughly monthly. Re-run `build-data.py`
+when the feed's end date passes:
 
 ```bash
 cd bus.jjjp.ca
 python3 build-data.py                    # downloads the latest GTFS export
-git commit -am "Refresh GTFS schedule"   # commits data/gtfs-bus.json
+git add data && git commit -m "Refresh GTFS schedule"
 git push
-# then copy the regenerated schedule.json to jjjp.ca/bus/ on the NAS
+# then copy schedule-meta.json and the schedule/ folder to jjjp.ca/bus/ on the NAS
 ```
 
 `build-data.py` needs only Python 3 (standard library) and runs on your
-computer — the NAS only ever runs PHP. To add routes, edit the `ROUTES` list
-at the top of the script (and `TRACK_ROUTES` in `bus_lib.php` if you want
-reliability stats for them too).
+computer — the NAS only ever runs PHP. By default it bundles **every** route;
+to build a smaller subset, set the `ROUTES` list at the top of the script to
+the route short names you want.
 
 ## Optional: require login
 
@@ -160,8 +180,10 @@ python3 -m http.server 8000                    # serves the static site
 php -S 127.0.0.1:8787 -t ../jjjp.ca/bus         # serves api.php
 ```
 
-Then set `window.BUS_API_URL = 'http://127.0.0.1:8787/api.php'` in the
-console before reload (the proxy already allows the localhost origin).
+For the proxy to serve reliability stats locally, copy `schedule-meta.json`
+and the `schedule/` folder into `../jjjp.ca/bus/` first. Then set
+`window.BUS_API_URL = 'http://127.0.0.1:8787/api.php'` in the console before
+reload (the proxy already allows the localhost origin).
 
 ---
 Data © OC Transpo / City of Ottawa (GTFS & GTFS-Realtime). Not affiliated

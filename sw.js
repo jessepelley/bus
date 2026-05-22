@@ -1,11 +1,16 @@
 /* Service worker for bus.jjjp.ca — app-shell cache so the PWA launches
    fast and offline. The realtime proxy (jjjp.ca) is never cached: it is
-   cross-origin and always goes straight to the network. */
-const CACHE = 'busjjjp-v1';
+   cross-origin and always goes straight to the network.
+
+   Per-route files (data/routes/<id>.json) are not pre-cached — they are
+   fetched on demand and then kept by the stale-while-revalidate handler
+   below, so only the routes a visitor actually opens are stored. */
+const CACHE = 'busjjjp-v2';
 const SHELL = [
   './', './index.html', './app.js', './auth.js', './styles.css',
   './manifest.json', './favicon.svg', './icon.svg',
-  './icon-192.png', './icon-512.png', './data/gtfs-bus.json',
+  './icon-192.png', './icon-512.png',
+  './data/index.json', './data/stops.json',
 ];
 
 self.addEventListener('install', (e) => {

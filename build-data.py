@@ -2,31 +2,48 @@
 """
 build-data.py — Generate the bundled data for bus.jjjp.ca
 
-Produces two files from the OC Transpo static GTFS export:
+The app supports **every OC Transpo route**, so the schedule data is split
+into small per-route files that the app and the NAS load on demand — rather
+than one giant bundle that every visitor would have to download.
 
-  data/gtfs-bus.json   — bundled with the static site. Stop lists, shapes and
-                         a trip->pattern map for the start-to-end timeline.
+Produces, from the OC Transpo static GTFS export:
 
-  schedule.json        — a NAS-side file (NOT served by the static site; it is
-                         .gitignored). The reliability collector on the NAS
-                         needs the *scheduled* arrival time of every trip/stop
-                         to measure lateness — the realtime feed doesn't carry
-                         a usable delay value. Copy this to jjjp.ca/bus/ on the
-                         NAS after each rebuild.
+  data/index.json       — bundled with the static site. Every route's name,
+                           colour and per-direction headsign. Small; loaded
+                           once at app launch to populate the route picker.
+  data/stops.json       — bundled. Every stop (id -> code/name/lat/lon).
+                           Shared by all routes; powers "find stops near me".
+  data/routes/<id>.json — bundled, one per route. Stop lists, shapes and the
+                           trip->pattern map for that route's timeline. The
+                           app fetches a route file only when that route is
+                           actually shown.
+
+  schedule-meta.json    — a NAS-side file (NOT served by the static site; it
+                           is .gitignored). GTFS calendar — service days and
+                           exceptions — shared by every route.
+  schedule/<id>.json    — NAS-side, one per route. Scheduled arrival time of
+                           every trip/stop. api.php reads the meta file plus
+                           the one route file a stats request asks for, so the
+                           reliability endpoint never decodes a huge blob.
 
 OC Transpo republishes the schedule roughly monthly. Re-run this script when
-the feed's end date passes, then commit data/gtfs-bus.json and copy the new
-schedule.json to the NAS.
+the feed's end date passes, then commit data/ and copy schedule-meta.json and
+the schedule/ folder to jjjp.ca/bus/ on the NAS.
 
 Usage:
     python3 build-data.py                 # downloads the GTFS zip fresh
     python3 build-data.py /path/to/dir    # uses an already-extracted folder
     python3 build-data.py /path/to/GTFSExport.zip
+
+To limit the build to a few routes (faster; smaller), set ROUTES below to a
+list of route short names. Empty list = every route.
 """
 
 import csv
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
 import urllib.request
@@ -34,19 +51,30 @@ import zipfile
 from datetime import date
 
 # ── Configuration ────────────────────────────────────────────────────────────
-ROUTES = ["45", "5"]                       # routes to include, by short name
+ROUTES = []                                # route short names; [] = every route
 
 GTFS_URL = "https://oct-gtfs-emasagcnfmcgeham.z01.azurefd.net/public-access/GTFSExport.zip"
 
 HERE          = os.path.dirname(os.path.abspath(__file__))
-GTFS_OUT      = os.path.join(HERE, "data", "gtfs-bus.json")
-SCHEDULE_OUT  = os.path.join(HERE, "schedule.json")
+DATA_DIR      = os.path.join(HERE, "data")
+ROUTES_DIR    = os.path.join(DATA_DIR, "routes")
+INDEX_OUT     = os.path.join(DATA_DIR, "index.json")
+STOPS_OUT     = os.path.join(DATA_DIR, "stops.json")
+SCHED_META    = os.path.join(HERE, "schedule-meta.json")
+SCHED_DIR     = os.path.join(HERE, "schedule")
 
 csv.field_size_limit(10 * 1024 * 1024)     # stop_times.txt is ~230 MB
 
 
 def log(msg):
     print(msg, file=sys.stderr)
+
+
+def slug(route_id):
+    """Filename-safe form of a route id (used for data/routes/ and schedule/).
+       app.js and api.php sanitise the route the same way — keep them in sync.
+       Dots are excluded so a route id can never form a '..' path segment."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", route_id)
 
 
 def gtfs_secs(t):
@@ -94,35 +122,48 @@ def main():
         return os.path.join(gtfs_dir, name)
 
     # ── routes.txt ───────────────────────────────────────────────────────────
-    routes = {}
-    want_route_ids = set()
+    # The GTFS-Realtime feed identifies a route by its SHORT NAME ("5"), not
+    # its GTFS route_id ("1-350"). The short name is therefore the canonical
+    # id used everywhere — in the bundle, on the NAS and in the realtime feed.
+    routes = {}                            # route_short_name -> route dict
+    rid_to_short = {}                      # GTFS route_id -> short name
     for r in read_csv(p("routes.txt")):
-        if r["route_short_name"] in ROUTES:
-            rid = r["route_id"]
-            want_route_ids.add(rid)
-            routes[rid] = {
-                "short": r["route_short_name"],
-                "long": r["route_long_name"],
-                "color": r.get("route_color") or "0057B8",
-                "text": r.get("route_text_color") or "FFFFFF",
-                "patterns": [],
-            }
-    log(f"Routes matched: {sorted(want_route_ids)}")
+        short = (r.get("route_short_name") or "").strip()
+        if not short:
+            continue                       # un-numbered route — not in the RT feed
+        if ROUTES and short not in ROUTES:
+            continue
+        rid_to_short[r["route_id"]] = short
+        routes[short] = {
+            "short": short,
+            "long": r["route_long_name"],
+            "color": r.get("route_color") or "0057B8",
+            "text": r.get("route_text_color") or "FFFFFF",
+            "patterns": [],
+        }
+    log(f"Routes matched: {len(routes)}")
+
+    # Guard against two route names collapsing to the same on-disk filename.
+    seen_slugs = {}
+    for short in routes:
+        s = slug(short)
+        if s in seen_slugs:
+            log(f"WARNING: routes {seen_slugs[s]!r} and {short!r} both map to "
+                f"file slug {s!r} — one will overwrite the other.")
+        seen_slugs[s] = short
 
     # ── trips.txt ────────────────────────────────────────────────────────────
     trips = {}
-    want_shapes = set()
     for t in read_csv(p("trips.txt")):
-        if t["route_id"] in want_route_ids:
+        short = rid_to_short.get(t["route_id"])
+        if short:
             trips[t["trip_id"]] = {
-                "route": t["route_id"],
+                "route": short,
                 "service": t.get("service_id", "").strip(),
                 "dir": int(t.get("direction_id") or 0),
                 "headsign": t.get("trip_headsign", "").strip(),
                 "shape": t.get("shape_id", "").strip(),
             }
-            if t.get("shape_id"):
-                want_shapes.add(t["shape_id"])
     log(f"Trips for these routes: {len(trips)}")
 
     # ── stop_times.txt — the big one; stream it ──────────────────────────────
@@ -142,8 +183,9 @@ def main():
     log(f"Stop-time rows collected for {len(trip_stops)} trips")
 
     # ── Build distinct patterns per route ────────────────────────────────────
-    patterns = {}
-    trip_patterns = {}
+    patterns = {}                          # signature -> pattern dict
+    trip_patterns = {}                     # trip_id  -> pattern id
+    want_shapes = set()
     per_route_dir_count = {}
     for tid, stops in trip_stops.items():
         meta = trips[tid]
@@ -161,19 +203,24 @@ def main():
             }
         patterns[sig]["trip_count"] += 1
         trip_patterns[tid] = patterns[sig]["id"]
+        if patterns[sig]["shape"]:
+            want_shapes.add(patterns[sig]["shape"])
 
     for pat in patterns.values():
         routes[pat["route"]]["patterns"].append(pat)
     for r in routes.values():
         r["patterns"].sort(key=lambda x: (x["dir"], -len(x["stops"])))
     log(f"Distinct patterns: {len(patterns)}")
-    for r in routes.values():
-        for pat in r["patterns"]:
-            log(f'  route {r["short"]:>3}  {pat["id"]:<10} dir{pat["dir"]} '
-                f'{len(pat["stops"]):>3} stops {pat["trip_count"]:>4} trips '
-                f'-> {pat["headsign"]}')
 
     # ── stops.txt ────────────────────────────────────────────────────────────
+    # Which route short names serve each stop — so "find stops near me" can
+    # label every stop even though the app only loads a few route files.
+    stop_routes = {}
+    for pat in patterns.values():
+        short = routes[pat["route"]]["short"]
+        for sid in pat["stops"]:
+            stop_routes.setdefault(sid, set()).add(short)
+
     stops = {}
     for s in read_csv(p("stops.txt")):
         if s["stop_id"] in used_stop_ids:
@@ -182,6 +229,7 @@ def main():
                 "name": s["stop_name"].strip(),
                 "lat": round(float(s["stop_lat"]), 6),
                 "lon": round(float(s["stop_lon"]), 6),
+                "r": sorted(stop_routes.get(s["stop_id"], [])),
             }
     log(f"Stops: {len(stops)}")
 
@@ -198,18 +246,6 @@ def main():
         shapes[sid] = [[lat, lon] for _, lat, lon in shapes[sid]]
     log(f"Shapes: {len(shapes)}")
 
-    # ── Write the static-site bundle ─────────────────────────────────────────
-    gtfs_out = {
-        "generated": date.today().isoformat(),
-        "source": GTFS_URL,
-        "routes": routes, "stops": stops, "shapes": shapes,
-        "trip_patterns": trip_patterns,
-    }
-    os.makedirs(os.path.dirname(GTFS_OUT), exist_ok=True)
-    with open(GTFS_OUT, "w", encoding="utf-8") as f:
-        json.dump(gtfs_out, f, ensure_ascii=False, separators=(",", ":"))
-    log(f"\nWrote {GTFS_OUT}  ({os.path.getsize(GTFS_OUT) // 1024} KB)")
-
     # ── calendar.txt / calendar_dates.txt — for no-show detection ────────────
     services = {}
     for c in read_csv(p("calendar.txt")):
@@ -224,27 +260,79 @@ def main():
             exceptions.setdefault(c["date"], []).append(
                 [c["service_id"], int(c["exception_type"])])
 
-    # ── Write the NAS-side schedule (scheduled arrival times) ────────────────
-    # trip_id -> [route, service_id, start_secs, [[stop_id, seq, secs], ...]]
-    sched_trips = {}
-    for tid, stops_list in trip_stops.items():
-        meta = trips[tid]
-        seq_stops = [[s, seq, secs] for seq, s, secs in stops_list]
-        start_secs = next((x[2] for x in seq_stops if x[2] is not None), 0)
-        sched_trips[tid] = [meta["route"], meta["service"], start_secs, seq_stops]
+    today = date.today().isoformat()
 
-    schedule_out = {
-        "generated": date.today().isoformat(),
-        "tz": "America/Toronto",
-        "routes": ROUTES,
-        "services": services,
-        "exceptions": exceptions,
-        "trips": sched_trips,
-    }
-    with open(SCHEDULE_OUT, "w", encoding="utf-8") as f:
-        json.dump(schedule_out, f, ensure_ascii=False, separators=(",", ":"))
-    log(f"Wrote {SCHEDULE_OUT}  ({os.path.getsize(SCHEDULE_OUT) // 1024} KB)"
-        f"  — copy this to jjjp.ca/bus/ on the NAS")
+    # ── Write the static-site files ──────────────────────────────────────────
+    # Recreate data/routes/ from scratch so dropped routes don't linger.
+    if os.path.isdir(ROUTES_DIR):
+        shutil.rmtree(ROUTES_DIR)
+    os.makedirs(ROUTES_DIR, exist_ok=True)
+
+    def dump(path, obj):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+        return os.path.getsize(path)
+
+    # index.json — every route, light metadata only.
+    index_routes = {}
+    for short, r in routes.items():
+        dirs = {}
+        for pat in r["patterns"]:          # patterns are sorted longest-first per dir
+            dirs.setdefault(pat["dir"], pat["headsign"])
+        index_routes[short] = {
+            "short": r["short"], "long": r["long"],
+            "color": r["color"], "text": r["text"],
+            "file": slug(short),
+            "dirs": [{"dir": d, "headsign": h} for d, h in sorted(dirs.items())],
+        }
+    sz = dump(INDEX_OUT, {
+        "generated": today, "source": GTFS_URL, "tz": "America/Toronto",
+        "routes": index_routes,
+    })
+    log(f"Wrote {INDEX_OUT}  ({sz // 1024} KB, {len(index_routes)} routes)")
+
+    sz = dump(STOPS_OUT, stops)
+    log(f"Wrote {STOPS_OUT}  ({sz // 1024} KB, {len(stops)} stops)")
+
+    # data/routes/<id>.json — patterns, shapes and trip->pattern map per route.
+    total = 0
+    for short, r in routes.items():
+        route_shapes = {pat["shape"]: shapes.get(pat["shape"], [])
+                        for pat in r["patterns"] if pat["shape"]}
+        route_tp = {tid: pid for tid, pid in trip_patterns.items()
+                    if trips[tid]["route"] == short}
+        total += dump(os.path.join(ROUTES_DIR, slug(short) + ".json"), {
+            "route": short, "patterns": r["patterns"],
+            "shapes": route_shapes, "trip_patterns": route_tp,
+        })
+    log(f"Wrote {len(routes)} files to {ROUTES_DIR}  ({total // 1024} KB total)")
+
+    # ── Write the NAS-side schedule ──────────────────────────────────────────
+    # schedule-meta.json — calendar, shared by every route.
+    sz = dump(SCHED_META, {
+        "generated": today, "tz": "America/Toronto",
+        "services": services, "exceptions": exceptions,
+    })
+    log(f"Wrote {SCHED_META}  ({sz // 1024} KB)  — copy this to jjjp.ca/bus/")
+
+    # schedule/<id>.json — trip_id -> [route, service, start_secs, stops] per route.
+    if os.path.isdir(SCHED_DIR):
+        shutil.rmtree(SCHED_DIR)
+    os.makedirs(SCHED_DIR, exist_ok=True)
+    total = 0
+    for short in routes:
+        sched_trips = {}
+        for tid, stops_list in trip_stops.items():
+            if trips[tid]["route"] != short:
+                continue
+            meta = trips[tid]
+            seq_stops = [[s, seq, secs] for seq, s, secs in stops_list]
+            start_secs = next((x[2] for x in seq_stops if x[2] is not None), 0)
+            sched_trips[tid] = [short, meta["service"], start_secs, seq_stops]
+        total += dump(os.path.join(SCHED_DIR, slug(short) + ".json"),
+                      {"route": short, "trips": sched_trips})
+    log(f"Wrote {len(routes)} files to {SCHED_DIR}  ({total // 1024} KB total)"
+        f"  — copy this folder to jjjp.ca/bus/ on the NAS")
 
 
 if __name__ == "__main__":

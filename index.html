@@ -6,6 +6,7 @@
 <title>OC Transpo Live — Bus Timeline</title>
 <meta name="description" content="Live OC Transpo bus locations and arrival times as a route timeline.">
 <meta name="theme-color" content="#ffffff" id="theme-color-meta">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Bus Live">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -33,7 +34,10 @@
 
     <section class="panel">
       <h2>Lines</h2>
-      <p class="hint">Pick the routes &amp; directions to show.</p>
+      <p class="hint">Search any OC Transpo route by number or destination,
+        then tick the directions to show.</p>
+      <input id="line-search" class="line-search" type="search"
+        placeholder="Search routes — e.g. 5, 45, Rideau" autocomplete="off">
       <div id="line-picker" class="line-picker"></div>
     </section>
 

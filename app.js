@@ -1,14 +1,21 @@
 /* ════════════════════════════════════════════════════════════════════════
    OC Transpo Live — bus.jjjp.ca
-   Static front-end. Talks to the NAS proxy for the realtime feeds and to a
-   bundled GTFS schedule (data/gtfs-bus.json) for the start-to-end stop list.
+   Static front-end. Talks to the NAS proxy for the realtime feeds and to the
+   bundled GTFS schedule (data/index.json + per-route data/routes/<id>.json,
+   loaded on demand) for the start-to-end stop list.
    ════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
 // Production proxy. For local testing, set window.BUS_API_URL before app.js
 // loads to point at a local PHP server — api.php allows the localhost origin.
 const API_URL   = window.BUS_API_URL || 'https://jjjp.ca/bus/api.php';
-const DATA_URL  = 'data/gtfs-bus.json';
+// Bundled schedule data. index.json + stops.json load once at launch; each
+// route's stop lists / shapes live in data/routes/<id>.json and are fetched
+// only when that route is actually shown — so the app stays light no matter
+// how many of OC Transpo's routes are in the bundle.
+const INDEX_URL = 'data/index.json';
+const STOPS_URL = 'data/stops.json';
+const ROUTE_URL = (file) => `data/routes/${file}.json`;
 const PREFS_KEY = 'busjjjp.prefs';
 const STALE_VEHICLE = 150;                  // s — a bus older than this is "faded"
 
@@ -19,10 +26,12 @@ const TILES = {
 const META_THEME = { light: '#ffffff', dark: '#16161a' };
 
 /* ── State ──────────────────────────────────────────────────────────────── */
-let GTFS        = null;
-let LINES       = new Map();                // "route:dir" -> line object
+let GTFS        = null;                     // {generated, routes, stops, shapes, trip_patterns}
+let LINES       = new Map();                // "route:dir" -> line object (pattern filled lazily)
 let PATTERNS    = new Map();                // patternId -> pattern object
-let stopRoutes  = new Map();                // stopId -> Set of route short names
+let loadedRoutes = new Set();               // route ids whose data/routes/<id>.json is loaded
+const routeLoads = new Map();               // route id -> in-flight load Promise (dedup)
+const routeLoadFailed = new Set();          // route ids whose detail file failed to load
 
 let runs        = [];
 let lastData    = null;
@@ -57,22 +66,33 @@ async function init() {
   setSidebar(window.innerWidth > 760);
 
   try {
-    const res = await fetch(DATA_URL);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    GTFS = await res.json();
+    const [index, stops] = await Promise.all([
+      fetch(INDEX_URL).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
+      fetch(STOPS_URL).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
+    ]);
+    GTFS = {
+      generated: index.generated, tz: index.tz,
+      routes: index.routes,                  // light metadata; patterns added on load
+      stops,                                 // all stops, shared by every route
+      shapes: {}, trip_patterns: {},         // merged in as route files load
+    };
   } catch (e) {
     document.getElementById('timelines').innerHTML =
       `<div class="empty-state">Could not load the bundled schedule
-       (${DATA_URL}). Run <code>build-data.py</code> first.</div>`;
+       (${INDEX_URL}). Run <code>build-data.py</code> first.</div>`;
     return;
   }
 
-  prepareGtfs();
+  buildLinesFromIndex();
   document.getElementById('data-date').textContent = GTFS.generated || '—';
 
   prefs.lines = prefs.lines.filter(k => LINES.has(k));
-  if (prefs.lines.length === 0) prefs.lines = [...LINES.keys()].slice(0, 2);
+  if (prefs.lines.length === 0)
+    prefs.lines = [...LINES.keys()].sort(compareLineKeys).slice(0, 2);
   for (const k of prefs.expanded) if (LINES.has(k)) expandedCards.add(k);
+
+  // Fetch the data files for the routes that are about to be shown.
+  await ensureLinesLoaded(prefs.lines);
 
   renderLinePicker();
   renderFavStops();
@@ -110,31 +130,94 @@ function registerServiceWorker() {
   }
 }
 
-/* ── Prepare bundled data ───────────────────────────────────────────────── */
-function prepareGtfs() {
+/* ── Bundled data: light index now, per-route detail on demand ──────────── */
+
+/* One LINES entry per route:direction, from the lightweight index. The
+   `pattern` (stop list + shape) is null until the route's file is loaded. */
+function buildLinesFromIndex() {
   for (const [rid, route] of Object.entries(GTFS.routes)) {
-    for (const pat of route.patterns) {
-      PATTERNS.set(pat.id, pat);
-      for (const sid of pat.stops) {
-        if (!stopRoutes.has(sid)) stopRoutes.set(sid, new Set());
-        stopRoutes.get(sid).add(route.short);
-      }
-    }
-    const byDir = {};
-    for (const pat of route.patterns) {
-      if (!byDir[pat.dir] || pat.stops.length > byDir[pat.dir].stops.length)
-        byDir[pat.dir] = pat;
-    }
-    for (const [dir, pat] of Object.entries(byDir)) {
-      const key = rid + ':' + dir;
+    route.patterns = route.patterns || [];
+    for (const d of route.dirs || []) {
+      const key = rid + ':' + d.dir;
       LINES.set(key, {
-        key, routeId: rid, dir: +dir,
+        key, routeId: rid, dir: d.dir,
         short: route.short, long: route.long,
         color: '#' + route.color, text: '#' + route.text,
-        headsign: pat.headsign, pattern: pat,
+        headsign: d.headsign, pattern: null,
       });
     }
   }
+}
+
+/* Fetch and merge one route's detail file (patterns, shapes, trip->pattern).
+   Deduplicates concurrent calls and is a no-op once a route is loaded. */
+function loadRouteData(rid) {
+  if (loadedRoutes.has(rid)) return Promise.resolve();
+  if (routeLoads.has(rid)) return routeLoads.get(rid);
+
+  const route = GTFS.routes[rid];
+  if (!route) return Promise.resolve();
+
+  const promise = fetch(ROUTE_URL(route.file))
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(detail => {
+      route.patterns = detail.patterns || [];
+      Object.assign(GTFS.shapes, detail.shapes || {});
+      Object.assign(GTFS.trip_patterns, detail.trip_patterns || {});
+      prepareRoute(rid);
+      loadedRoutes.add(rid);
+      routeLoadFailed.delete(rid);
+    })
+    .catch(e => {
+      console.error('route ' + rid + ' failed to load', e);
+      routeLoadFailed.add(rid);          // don't auto-retry every render
+    })
+    .finally(() => routeLoads.delete(rid));
+
+  routeLoads.set(rid, promise);
+  return promise;
+}
+
+/* Index PATTERNS and fill each LINES entry's representative pattern (the
+   longest one per direction) once a route's detail file has arrived. */
+function prepareRoute(rid) {
+  const route = GTFS.routes[rid];
+  const byDir = {};
+  for (const pat of route.patterns) {
+    PATTERNS.set(pat.id, pat);
+    if (!byDir[pat.dir] || pat.stops.length > byDir[pat.dir].stops.length)
+      byDir[pat.dir] = pat;
+  }
+  for (const [dir, pat] of Object.entries(byDir)) {
+    const key = rid + ':' + dir;
+    let line = LINES.get(key);
+    if (!line) {
+      line = { key, routeId: rid, dir: +dir,
+               short: route.short, long: route.long,
+               color: '#' + route.color, text: '#' + route.text,
+               headsign: pat.headsign, pattern: null };
+      LINES.set(key, line);
+    }
+    line.pattern = pat;
+    line.headsign = pat.headsign;
+  }
+}
+
+/* Ensure the detail files for every route referenced by these line keys are
+   loaded. Returns a Promise that resolves once they all are. */
+function ensureLinesLoaded(lineKeys) {
+  const rids = [...new Set(
+    lineKeys.map(k => LINES.get(k)).filter(Boolean).map(l => l.routeId))];
+  return Promise.all(rids.map(loadRouteData));
+}
+
+/* Sort "route:dir" keys by route number, then direction. */
+function compareLineKeys(a, b) {
+  const la = LINES.get(a), lb = LINES.get(b);
+  const na = parseInt(la ? la.short : a, 10);
+  const nb = parseInt(lb ? lb.short : b, 10);
+  if (!isNaN(na) && !isNaN(nb) && na !== nb) return na - nb;
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /* ── Preferences ────────────────────────────────────────────────────────── */
@@ -196,6 +279,8 @@ function wireChrome() {
   };
 
   document.getElementById('nearby-btn').onclick = findNearby;
+
+  document.getElementById('line-search').oninput = () => renderLinePicker();
 }
 
 function setSidebar(open) {
@@ -223,8 +308,19 @@ function rowH() {
 /* ── Realtime poll ──────────────────────────────────────────────────────── */
 async function poll() {
   const btn = document.getElementById('refresh-btn');
+  // Only ask the proxy for the routes currently on screen — this keeps the
+  // realtime payload small and scopes the proxy's reliability sampling to
+  // exactly the routes people are looking at.
+  const routes = [...new Set(
+    prefs.lines.map(k => LINES.get(k)).filter(Boolean).map(l => l.routeId))].join(',');
+  if (!routes) {
+    lastData = { ok: true, fetched: Date.now() / 1000, vehicles: [], trips: [] };
+    lastPollClient = Date.now();
+    buildRuns();
+    renderAll();
+    return;
+  }
   btn.classList.add('spinning');
-  const routes = Object.keys(GTFS.routes).join(',');
   try {
     const headers = {};
     if (auth.isAuthenticated()) headers['X-API-Key'] = auth.getToken();
@@ -388,6 +484,23 @@ function renderTimelines() {
 
 function buildTimelineCard(line) {
   const now = serverNow();
+
+  // Route detail not in yet — show a placeholder and kick off the load
+  // (unless a previous attempt failed, in which case don't retry-spam).
+  if (!line.pattern) {
+    const failed = routeLoadFailed.has(line.routeId);
+    if (!failed)
+      loadRouteData(line.routeId).then(() => { if (line.pattern) renderTimelines(); });
+    const card = document.createElement('div');
+    card.className = 'timeline-card';
+    card.innerHTML = `<div class="timeline-head">
+      <span class="route-badge" style="background:${line.color};color:${line.text}">
+        ${esc(line.short)}</span>
+      <span class="tl-title">→ ${esc(line.headsign)}</span>
+      <span class="tl-sub">${failed ? 'route data unavailable' : 'loading…'}</span></div>`;
+    return card;
+  }
+
   const lineRuns = runs.filter(r => r.lineKey === line.key);
   const expanded = expandedCards.has(line.key);
 
@@ -420,8 +533,8 @@ function buildTimelineCard(line) {
   return card;
 }
 
-/* A per-route reliability summary. Hidden entirely if the collector hasn't
-   been set up (stats endpoint reports unavailable). */
+/* A per-route reliability summary. Hidden entirely if the stats endpoint
+   reports unavailable (no schedule deployed, or no data gathered yet). */
 function buildReliabilityStrip(routeId) {
   const s = statsByRoute[routeId];
   if (!s || !s.available) return null;
@@ -434,7 +547,7 @@ function buildReliabilityStrip(routeId) {
     parts.push(`${otp}% on time today`);
     if (today.avg_delay_sec != null) parts.push('avg ' + fmtDelay(today.avg_delay_sec));
   } else {
-    parts.push('today: collecting…');
+    parts.push('today: no data yet');
   }
   if (today && today.scheduled > 0) parts.push(`${today.observed}/${today.scheduled} trips ran`);
   if (s.days > 1 && s.measured > 0) parts.push(`7-day ${s.on_time_pct}%`);
@@ -446,18 +559,16 @@ function buildReliabilityStrip(routeId) {
   el.className = 'reliability';
   const mf = s.monitored_from;
   el.title = 'On-time = within −1 to +5 min of schedule, estimated from '
-    + 'predicted arrivals. Cancellations are inferred — OC Transpo publishes '
-    + 'no official cancellation signal. '
-    + (mf ? 'Monitored since ' + fmtClock(mf) + '.' : 'Not monitored yet today.');
+    + 'predicted arrivals. Reliability is gathered while people use the app — '
+    + 'numbers cover the times this route was being watched, not the whole day. '
+    + 'Cancellations are inferred — OC Transpo publishes no official signal. '
+    + (mf ? 'Watched since ' + fmtClock(mf) + ' today.' : 'Not watched yet today.');
 
   let html = `<span class="rel-dot ${dotCls}"></span>`
            + `<span class="rel-text">${esc(parts.join(' · '))}`;
   if (today && today.missed > 0)
     html += ` · <span class="rel-miss">${today.missed} missed</span>`;
   html += '</span>';
-  if (s.collector && !s.collector.healthy)
-    html += '<span class="rel-warn" title="Collector has not reported recently">'
-          + '⚠ collector offline</span>';
   el.innerHTML = html;
   return el;
 }
@@ -688,30 +799,71 @@ function renderMap() {
 }
 
 /* ── Line picker ────────────────────────────────────────────────────────── */
+/* Every OC Transpo route is available, so the picker is search-driven: with
+   no query it lists only the lines already chosen; type a route number or a
+   destination to find more. */
 function renderLinePicker() {
   const host = document.getElementById('line-picker');
+  const searchEl = document.getElementById('line-search');
+  const q = (searchEl ? searchEl.value : '').trim().toLowerCase();
   host.innerHTML = '';
-  for (const line of LINES.values()) {
+
+  const selected = new Set(prefs.lines);
+  let shown = [...LINES.values()];
+  shown = q
+    ? shown.filter(l => l.short.toLowerCase().includes(q) ||
+                        (l.headsign || '').toLowerCase().includes(q))
+    : shown.filter(l => selected.has(l.key));
+  shown.sort((a, b) => compareLineKeys(a.key, b.key));
+
+  const CAP = 60;
+  const truncated = Math.max(0, shown.length - CAP);
+  if (truncated) shown = shown.slice(0, CAP);
+
+  if (shown.length === 0) {
+    host.innerHTML = q
+      ? `<div class="empty-mini">No routes match “${esc(q)}”.</div>`
+      : `<div class="empty-mini">No lines selected — search a route number
+         or destination above.</div>`;
+    return;
+  }
+
+  for (const line of shown) {
     const lbl = document.createElement('label');
     lbl.className = 'line-opt';
     lbl.innerHTML = `
-      <input type="checkbox" ${prefs.lines.includes(line.key) ? 'checked' : ''}>
+      <input type="checkbox" ${selected.has(line.key) ? 'checked' : ''}>
       <span class="route-badge" style="background:${line.color};color:${line.text}">
         ${esc(line.short)}</span>
       <span class="ln-name">→ ${esc(line.headsign)}</span>`;
-    lbl.querySelector('input').onchange = (e) => {
+    lbl.querySelector('input').onchange = async (e) => {
       if (e.target.checked) {
         if (!prefs.lines.includes(line.key)) prefs.lines.push(line.key);
         if (!prefs.compact) expandedCards.add(line.key);
+        savePrefs();
+        renderLinePicker();
+        renderTimelines();                  // shows a "loading…" card meanwhile
+        await loadRouteData(line.routeId);
+        renderTimelines();
+        poll();                             // pull realtime for the new route
+        pollStats();
       } else {
         prefs.lines = prefs.lines.filter(k => k !== line.key);
         expandedCards.delete(line.key);
+        savePrefs();
+        renderLinePicker();
+        renderTimelines();
       }
-      savePrefs();
-      renderTimelines();
       if (prefs.showMap && map) drawMapStatic();
     };
     host.appendChild(lbl);
+  }
+
+  if (truncated) {
+    const more = document.createElement('div');
+    more.className = 'empty-mini';
+    more.textContent = `+${truncated} more — keep typing to narrow down.`;
+    host.appendChild(more);
   }
 }
 
@@ -764,7 +916,7 @@ function findNearby() {
 
     list.innerHTML = '';
     for (const { sid, s, d } of ranked) {
-      const rts = [...(stopRoutes.get(sid) || [])].sort().join(', ');
+      const rts = (s.r || []).join(', ');
       const item = document.createElement('div');
       item.className = 'nearby-item';
       item.innerHTML = `
