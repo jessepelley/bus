@@ -1,11 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="12" fill="#0d0d0f"/>
-  <rect x="16" y="12" width="32" height="34" rx="6" fill="#3b82f6"/>
-  <rect x="20" y="18" width="24" height="10" rx="2" fill="#0d0d0f"/>
-  <circle cx="23" cy="38" r="3" fill="#0d0d0f"/>
-  <circle cx="41" cy="38" r="3" fill="#0d0d0f"/>
-  <circle cx="22" cy="50" r="5" fill="#e9e9ee"/>
-  <circle cx="42" cy="50" r="5" fill="#e9e9ee"/>
-  <rect x="14" y="26" width="3" height="8" rx="1.5" fill="#da291c"/>
-  <rect x="47" y="26" width="3" height="8" rx="1.5" fill="#da291c"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="1000"><metadata><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/"><rdf:Description><dc:creator>RealFaviconGenerator</dc:creator><dc:source>https://realfavicongenerator.net</dc:source></rdf:Description></rdf:RDF></metadata><g clip-path="url(#SvgjsClipPath1119)"><rect width="1000" height="1000" fill="#ffffff"></rect><g transform="matrix(50,0,0,50,100,100)"><svg xmlns="http://www.w3.org/2000/svg" style="color:#D71920;" width="16" height="16" fill="currentColor" class="bi bi-bus-front-fill" viewBox="0 0 16 16"><path d="M16 7a1 1 0 0 1-1 1v3.5c0 .818-.393 1.544-1 2v2a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1-.5-.5V14H5v1.5a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1-.5-.5v-2a2.5 2.5 0 0 1-1-2V8a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1V2.64C1 1.452 1.845.408 3.064.268A44 44 0 0 1 8 0c2.1 0 3.792.136 4.936.268C14.155.408 15 1.452 15 2.64V4a1 1 0 0 1 1 1zM3.552 3.22A43 43 0 0 1 8 3c1.837 0 3.353.107 4.448.22a.5.5 0 0 0 .104-.994A44 44 0 0 0 8 2c-1.876 0-3.426.109-4.552.226a.5.5 0 1 0 .104.994M8 4c-1.876 0-3.426.109-4.552.226A.5.5 0 0 0 3 4.723v3.554a.5.5 0 0 0 .448.497C4.574 8.891 6.124 9 8 9s3.426-.109 4.552-.226A.5.5 0 0 0 13 8.277V4.723a.5.5 0 0 0-.448-.497A44 44 0 0 0 8 4m-3 7a1 1 0 1 0-2 0 1 1 0 0 0 2 0m8 0a1 1 0 1 0-2 0 1 1 0 0 0 2 0m-7 0a1 1 0 0 0 1 1h2a1 1 0 1 0 0-2H7a1 1 0 0 0-1 1"></path></svg></g></g><defs><clipPath id="SvgjsClipPath1119"><rect width="1000" height="1000" x="0" y="0" rx="150" ry="150"></rect></clipPath></defs></svg>
