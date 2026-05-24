@@ -138,6 +138,9 @@ html.live .pill.fresh .pill-dot { animation: ripple 2.1s ease-out infinite; }
   flex: 1 1 auto; overflow-y: auto; padding: 1.1rem;
   display: flex; flex-direction: column; gap: 1.1rem;
 }
+/* More breathing room between each chosen line's timeline card. */
+#timelines { display: flex; flex-direction: column; gap: 1.5rem; }
+#timelines > .timeline-card { scroll-margin-top: 1rem; }
 
 .panel { background: var(--bg-3); border: 1px solid var(--line);
          border-radius: var(--radius); padding: .85rem; }
@@ -146,6 +149,30 @@ html.live .pill.fresh .pill-dot { animation: ripple 2.1s ease-out infinite; }
         line-height: 1.45; }
 
 #backdrop { display: none; }
+
+/* ── Line search — bigger, harder to miss ────────────────────────────────── */
+.line-search-wrap {
+  display: flex; align-items: center; gap: .55rem;
+  background: var(--bg-2);
+  border: 2px solid var(--accent);
+  border-radius: 11px;
+  padding: .6rem .8rem;
+  margin-bottom: .7rem;
+  transition: box-shadow .15s, border-color .15s;
+}
+.line-search-wrap:focus-within {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.20);
+}
+.line-search-icon { font-size: 1.05rem; line-height: 1; opacity: .85; }
+.line-search {
+  flex: 1 1 auto; min-width: 0;
+  background: transparent; color: var(--text);
+  border: none; outline: none;
+  font: inherit; font-size: 1rem;
+  padding: 0;
+}
+.line-search::placeholder { color: var(--text-mute); }
 
 /* ── Line picker ─────────────────────────────────────────────────────────── */
 .line-picker { display: flex; flex-direction: column; gap: .4rem; }
@@ -167,6 +194,37 @@ html.live .pill.fresh .pill-dot { animation: ripple 2.1s ease-out infinite; }
 }
 .route-badge.big { min-width: 38px; height: 28px; font-size: .95rem; }
 
+/* ── Stop groups (Work / Home / …) ───────────────────────────────────────── */
+.stop-groups {
+  display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .55rem;
+}
+.group-chip {
+  display: inline-flex; align-items: center; gap: .35rem;
+  padding: .3rem .55rem; border-radius: 999px;
+  background: var(--bg-2); border: 1px solid var(--line);
+  font-size: .78rem; cursor: pointer; color: var(--text);
+  transition: border-color .15s, background .15s;
+}
+.group-chip:hover { border-color: var(--accent); }
+.group-chip.active {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+.group-chip .grp-count {
+  font-size: .68rem; opacity: .8;
+  font-variant-numeric: tabular-nums;
+}
+.group-chip .grp-edit {
+  background: none; border: none; color: inherit; opacity: .55;
+  cursor: pointer; padding: 0 0 0 .15rem; font-size: .82rem; line-height: 1;
+}
+.group-chip .grp-edit:hover { opacity: 1; }
+.group-add {
+  background: var(--bg-2); color: var(--text-mute);
+  border: 1px dashed var(--line); border-radius: 999px;
+  padding: .3rem .55rem; cursor: pointer; font-size: .78rem;
+}
+.group-add:hover { border-color: var(--accent); color: var(--accent); }
+
 /* ── Favourite stops ─────────────────────────────────────────────────────── */
 .fav-stops { display: flex; flex-direction: column; gap: .35rem; margin-bottom: .6rem; }
 .fav-stop-row {
@@ -174,6 +232,14 @@ html.live .pill.fresh .pill-dot { animation: ripple 2.1s ease-out infinite; }
   background: var(--bg-2); border: 1px solid var(--line);
   border-radius: 8px; padding: .4rem .5rem;
 }
+.fav-live {
+  position: relative;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--text-mute); flex: 0 0 auto;
+  transition: background .2s;
+}
+.fav-live.on { background: var(--green); }
+html.live .fav-live.on { animation: ripple 2.1s ease-out infinite; }
 .fav-stop-row .stop-code, .dep-head .stop-code, .nearby-item .stop-code {
   font-variant-numeric: tabular-nums; color: var(--text-mute);
   font-size: .72rem; border: 1px solid var(--line); border-radius: 4px;
@@ -389,6 +455,107 @@ html.live .bus-dot::after {
   box-shadow: 0 1px 5px rgba(0,0,0,.55);
 }
 .leaflet-popup-content { font-size: .8rem; }
+
+/* Nearby-stops mini map (sidebar) */
+.nearby-controls { margin-top: .5rem; }
+.nearby-map {
+  margin-top: .5rem; height: 220px; width: 100%;
+  border: 1px solid var(--line); border-radius: 9px;
+  background: var(--bg-3); overflow: hidden;
+}
+.nearby-pin {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,.55);
+}
+.nearby-pin.me {
+  background: var(--red); width: 16px; height: 16px;
+}
+
+/* ── Per-saved-stop "mini" timeline strips (new compact view) ────────────── */
+.mini-strip {
+  display: flex; flex-direction: column; gap: .35rem;
+  padding: .65rem .8rem;
+  border-bottom: 1px solid var(--line);
+}
+.mini-strip:last-child { border-bottom: none; }
+.mini-strip.is-fav { background: var(--fav-bg); }
+.mini-head {
+  display: flex; align-items: center; gap: .5rem;
+  font-size: .85rem;
+}
+.mini-head .mini-name {
+  font-weight: 650; flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mini-head .stop-code-tag {
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 .25rem; font-size: .7rem;
+  font-variant-numeric: tabular-nums; color: var(--text-mute);
+}
+.mini-eta {
+  font-variant-numeric: tabular-nums; font-weight: 700;
+  font-size: 1rem; white-space: nowrap;
+}
+.mini-eta.soon  { color: var(--amber); }
+.mini-eta.now   { color: var(--red); }
+.mini-eta.later { color: var(--green); }
+.mini-eta.none  { color: var(--text-mute); font-weight: 500; font-size: .82rem; }
+
+/* The chain itself. A thin connector line runs at the dot's vertical centre
+   so the dots read as nodes on a route, not just floating circles. */
+.mini-chain {
+  position: relative;
+  display: flex; align-items: center;
+  padding: 20px 6px 6px;            /* top room for bus icon over a dot */
+}
+.mini-chain::before {
+  content: ""; position: absolute;
+  left: 14px; right: 14px;
+  top: 20px;                        /* matches padding-top above */
+  transform: translateY(5px);       /* offset by half the dot height */
+  height: 2px; background: var(--bg-4);
+  z-index: 0;
+}
+.chain-dot {
+  position: relative; z-index: 1;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--bg-2);
+  border: 2px solid var(--text-mute);
+  margin: 0 9px; flex: 0 0 auto;
+}
+.chain-dot.bus-here {
+  background: var(--accent); border-color: var(--accent);
+}
+.chain-dot.bus-here::after {
+  content: "🚌"; position: absolute;
+  left: 50%; bottom: calc(100% + 2px);
+  transform: translateX(-50%);
+  font-size: 13px; line-height: 1;
+  white-space: nowrap;
+}
+html.live .chain-dot.bus-here::before {
+  content: ""; position: absolute; inset: -3px;
+  border-radius: 50%;
+  animation: ripple 2.1s ease-out infinite;
+}
+.chain-dot.saved {
+  background: var(--amber); border-color: var(--amber);
+  box-shadow: 0 0 0 3px rgba(245,158,11,.22);
+}
+/* Skip cluster: three tiny dots packed close, implying hidden stops. */
+.chain-skip {
+  position: relative; z-index: 1;
+  display: inline-flex; align-items: center; gap: 2px;
+  margin: 0 6px;
+  padding: 2px 0;
+}
+.chain-skip .skip-dot {
+  width: 3px; height: 3px; border-radius: 50%;
+  background: var(--text-mute); opacity: .6;
+}
+.mini-empty { color: var(--text-mute); font-size: .78rem;
+  font-style: italic; padding: 0 .5rem .35rem; }
 
 /* ── Misc ────────────────────────────────────────────────────────────────── */
 .hidden { display: none !important; }

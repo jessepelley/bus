@@ -32,21 +32,32 @@
 
   <aside id="sidebar">
 
-    <section class="panel">
+    <section class="panel panel-lines">
       <h2>Lines</h2>
       <p class="hint">Search any OC Transpo route by number or destination,
         then tick the directions to show.</p>
-      <input id="line-search" class="line-search" type="search"
-        placeholder="Search routes — e.g. 5, 45, Rideau" autocomplete="off">
+      <label class="line-search-wrap" for="line-search">
+        <span class="line-search-icon" aria-hidden="true">🔍</span>
+        <input id="line-search" class="line-search" type="search"
+          placeholder="Search routes — e.g. 5, 45, Rideau" autocomplete="off">
+      </label>
       <div id="line-picker" class="line-picker"></div>
     </section>
 
     <section class="panel">
       <h2>My stops</h2>
-      <p class="hint">Favourited stops get a big arrivals card up top — your
-        “rush or relax?” glance.</p>
+      <p class="hint">Group your saved stops by trip — “to work”, “coming home”,
+        whatever. Tap a group to switch which set is in play.</p>
+      <div id="stop-groups" class="stop-groups"></div>
       <div id="fav-stops" class="fav-stops"></div>
       <button id="nearby-btn" class="wide-btn">📍 Find stops near me</button>
+      <div id="nearby-controls" class="nearby-controls hidden">
+        <label class="row-toggle">
+          <input type="checkbox" id="nearby-map-toggle">
+          <span>Show on a mini map</span>
+        </label>
+      </div>
+      <div id="nearby-map" class="nearby-map hidden"></div>
       <div id="nearby-list" class="nearby-list"></div>
     </section>
 

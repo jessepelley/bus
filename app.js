@@ -41,11 +41,16 @@ let renderTimer = null;
 let statsTimer  = null;
 let statsByRoute = {};                      // routeId -> reliability stats
 let map = null, mapLayers = null, tileLayer = null;
+let nearbyMap = null, nearbyMapLayers = null, nearbyTiles = null;
+let lastNearbyResults = null;               // { me:{lat,lon}, items:[{sid,s,d}] }
 const expandedCards = new Set();            // line keys shown as full timelines
 
 const prefs = {
   lines:    ['45:1', '5:0'],
-  favStops: [],
+  favStops: [],                             // mirror of activeGroup().stopIds — see syncActiveStops()
+  stopGroups: [],                           // [{ id, name, stopIds:[] }]
+  activeGroupId: null,
+  nearbyOnMap: false,
   showMap:  false,
   refresh:  20,
   theme:    'light',
@@ -225,13 +230,87 @@ function loadPrefs() {
   try {
     Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'));
   } catch (e) { /* keep defaults */ }
+  migrateStopGroups();
   document.getElementById('refresh-select').value = String(prefs.refresh);
   document.getElementById('theme-select').value = prefs.theme;
   document.getElementById('compact-toggle').checked = prefs.compact;
+  const nmToggle = document.getElementById('nearby-map-toggle');
+  if (nmToggle) nmToggle.checked = !!prefs.nearbyOnMap;
 }
 function savePrefs() {
   prefs.expanded = [...expandedCards];
-  localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  // favStops is a derived mirror of the active group; don't persist it.
+  const { favStops, ...persist } = prefs;
+  localStorage.setItem(PREFS_KEY, JSON.stringify(persist));
+}
+
+/* ── Stop groups ────────────────────────────────────────────────────────── */
+/* Backwards-compat: if the user has older prefs with a flat favStops array,
+   migrate it into a single "Saved" group. After this, the canonical store is
+   prefs.stopGroups and prefs.favStops is just a live mirror of whichever
+   group is currently active (kept so existing render code stays simple). */
+function migrateStopGroups() {
+  if (!Array.isArray(prefs.stopGroups) || prefs.stopGroups.length === 0) {
+    prefs.stopGroups = [{
+      id: 'g_default',
+      name: 'Saved',
+      stopIds: Array.isArray(prefs.favStops) ? prefs.favStops.slice() : [],
+    }];
+    prefs.activeGroupId = 'g_default';
+  } else if (!prefs.activeGroupId ||
+             !prefs.stopGroups.find(g => g.id === prefs.activeGroupId)) {
+    prefs.activeGroupId = prefs.stopGroups[0].id;
+  }
+  syncActiveStops();
+}
+function activeGroup() {
+  return prefs.stopGroups.find(g => g.id === prefs.activeGroupId) || prefs.stopGroups[0];
+}
+function syncActiveStops() {
+  prefs.favStops = activeGroup().stopIds.slice();
+}
+function setActiveGroup(gid) {
+  if (!prefs.stopGroups.find(g => g.id === gid)) return;
+  prefs.activeGroupId = gid;
+  syncActiveStops();
+  savePrefs();
+  renderFavStops();
+  renderDeparturesBoard();
+  renderTimelines();
+}
+function addGroup() {
+  const name = prompt('Name for this group of stops (e.g. “To work”):', '');
+  if (!name || !name.trim()) return;
+  const g = { id: 'g_' + Date.now().toString(36),
+              name: name.trim().slice(0, 40), stopIds: [] };
+  prefs.stopGroups.push(g);
+  setActiveGroup(g.id);
+}
+function editGroup(gid) {
+  const g = prefs.stopGroups.find(x => x.id === gid);
+  if (!g) return;
+  const reply = prompt(
+    `Rename “${g.name}”, or type the word "delete" to remove this group.\n` +
+    `(Stops in the group will be removed from your saved list, but the stops\n` +
+    ` themselves stay in OC Transpo — you can re-add them anywhere.)\n\n` +
+    `New name:`, g.name);
+  if (reply == null) return;
+  const text = reply.trim();
+  if (text.toLowerCase() === 'delete') {
+    if (prefs.stopGroups.length <= 1) {
+      toast('Keep at least one group — rename it instead.');
+      return;
+    }
+    if (!confirm(`Delete the “${g.name}” group?`)) return;
+    prefs.stopGroups = prefs.stopGroups.filter(x => x.id !== gid);
+    if (prefs.activeGroupId === gid)
+      prefs.activeGroupId = prefs.stopGroups[0].id;
+    setActiveGroup(prefs.activeGroupId);
+    return;
+  }
+  if (text) g.name = text.slice(0, 40);
+  savePrefs();
+  renderFavStops();
 }
 
 /* ── Theme ──────────────────────────────────────────────────────────────── */
@@ -246,6 +325,13 @@ function applyTheme(theme) {
       attribution: '© OpenStreetMap, © CARTO',
     }).addTo(map);
     tileLayer.bringToBack();
+  }
+  if (nearbyMap && nearbyTiles) {
+    nearbyMap.removeLayer(nearbyTiles);
+    nearbyTiles = L.tileLayer(TILES[theme], {
+      maxZoom: 20, subdomains: 'abcd',
+    }).addTo(nearbyMap);
+    nearbyTiles.bringToBack();
   }
 }
 
@@ -279,6 +365,17 @@ function wireChrome() {
   };
 
   document.getElementById('nearby-btn').onclick = findNearby;
+
+  const nmToggle = document.getElementById('nearby-map-toggle');
+  if (nmToggle) nmToggle.onchange = (e) => {
+    prefs.nearbyOnMap = e.target.checked;
+    savePrefs();
+    if (prefs.nearbyOnMap) {
+      enableNearbyMap();
+    } else {
+      document.getElementById('nearby-map').classList.add('hidden');
+    }
+  };
 
   document.getElementById('line-search').oninput = () => renderLinePicker();
 }
@@ -411,6 +508,7 @@ function makeRun(tr, line, lineKey, etas, nextStopId, veh) {
 function renderAll() {
   renderFreshness();
   renderDeparturesBoard();
+  renderFavStops();                          // refresh live-feed dots per poll
   renderTimelines();
   if (prefs.showMap && map) renderMap();
 }
@@ -573,23 +671,140 @@ function buildReliabilityStrip(routeId) {
   return el;
 }
 
-/* ── Compact body — bus-style strips ────────────────────────────────────── */
+/* ── Compact body — saved-stop view ─────────────────────────────────────── */
+/* The compact view is *from a saved stop's perspective*: for each saved stop
+   that lies on this line+direction, show one mini-strip that says where the
+   closest approaching bus currently is, using a chain-of-dots that omits the
+   stops in between. Falls back to per-bus strips if you have no saved stops
+   on this line yet. */
 function buildCompactBody(line, lineRuns, now) {
   const body = document.createElement('div');
   body.className = 'compact-body';
-  if (lineRuns.length === 0) {
-    body.innerHTML = `<div class="tl-empty">No buses currently running
-      this direction.</div>`;
+  const stops = line.pattern.stops;
+  const stopSet = new Set(stops);
+  // Saved stops in the active group that lie on this direction, in route order.
+  const savedOnLine = stops.filter(sid => activeGroup().stopIds.includes(sid));
+
+  if (savedOnLine.length === 0) {
+    const hint = document.createElement('div');
+    hint.className = 'mini-empty';
+    hint.textContent =
+      'No saved stops from “' + activeGroup().name + '” on this direction — ' +
+      'showing buses instead. Expand the timeline and tap ★ on a stop to ' +
+      'pin it here.';
+    body.appendChild(hint);
+    if (lineRuns.length === 0) {
+      const note = document.createElement('div');
+      note.className = 'tl-empty';
+      note.textContent = 'No buses currently running this direction.';
+      body.appendChild(note);
+      return body;
+    }
+    const ordered = lineRuns.slice().sort((a, b) => {
+      const ta = a.nextStopId ? a.etas.get(a.nextStopId) : Infinity;
+      const tb = b.nextStopId ? b.etas.get(b.nextStopId) : Infinity;
+      return (ta || Infinity) - (tb || Infinity);
+    });
+    for (const run of ordered) body.appendChild(buildBusStrip(run, line, now));
     return body;
   }
-  // Soonest buses first.
-  const ordered = lineRuns.slice().sort((a, b) => {
-    const ta = a.nextStopId ? a.etas.get(a.nextStopId) : Infinity;
-    const tb = b.nextStopId ? b.etas.get(b.nextStopId) : Infinity;
-    return (ta || Infinity) - (tb || Infinity);
-  });
-  for (const run of ordered) body.appendChild(buildBusStrip(run, line, now));
+
+  for (const sid of savedOnLine) {
+    body.appendChild(buildStopMiniStrip(sid, line, lineRuns, stops, now));
+  }
   return body;
+}
+
+/* One row per saved-stop-on-this-line: route badge, stop name, chain dots
+   showing the closest approaching bus's position, and ETA. */
+function buildStopMiniStrip(savedSid, line, lineRuns, stops, now) {
+  const savedIdx = stops.indexOf(savedSid);
+  const stop = GTFS.stops[savedSid] || { name: savedSid, code: '?' };
+
+  // Pick the run that reaches this stop soonest.
+  let bestRun = null, bestEta = Infinity;
+  for (const run of lineRuns) {
+    const t = run.etas.get(savedSid);
+    if (t == null || t < now - 30) continue;
+    if (t < bestEta) { bestEta = t; bestRun = run; }
+  }
+
+  // Where the chosen bus is right now (its next-stop index on this pattern).
+  let busIdx = -1;
+  if (bestRun) {
+    busIdx = bestRun.nextStopId ? stops.indexOf(bestRun.nextStopId) : -1;
+    if (busIdx < 0 && bestRun.vehicle && bestRun.vehicle.lat != null)
+      busIdx = nearestStopIndex(stops, bestRun.vehicle.lat, bestRun.vehicle.lon);
+  }
+
+  const strip = document.createElement('div');
+  strip.className = 'mini-strip is-fav';
+
+  const etaSec = bestRun ? bestEta - now : null;
+  const etaCls = etaSec == null ? 'none'
+    : (etaSec < 45 ? 'now' : etaSec < 6 * 60 ? 'soon' : 'later');
+  const etaText = etaSec == null ? 'no live bus' : fmtEta(etaSec);
+
+  const badgeRun = bestRun || { color: line.color, short: line.short };
+
+  strip.innerHTML = `
+    <div class="mini-head">
+      ${badge(badgeRun)}
+      <span class="mini-name" title="${esc(stop.name)}">${esc(stop.name)}</span>
+      <span class="stop-code-tag">#${esc(stop.code)}</span>
+      <span class="mini-eta ${etaCls}">${esc(etaText)}</span>
+    </div>
+    ${buildMiniChain(busIdx, savedIdx)}`;
+  return strip;
+}
+
+/* The visual symbol the user asked for:
+   bus • next-stop  ···(hidden)···  prev-of-saved • saved.
+   Big dots = visible stops, tiny clustered dots = omitted stops. */
+function buildMiniChain(busIdx, savedIdx) {
+  let html = '<div class="mini-chain">';
+  if (busIdx < 0) {
+    html += '<span class="chain-dot saved"></span>';
+    html += '</div>';
+    return html;
+  }
+  const gap = savedIdx - busIdx;
+  const skip = (n) => {
+    let s = '<span class="chain-skip">';
+    for (let i = 0; i < n; i++) s += '<span class="skip-dot"></span>';
+    return s + '</span>';
+  };
+  if (gap < 0) {
+    // Bus already past the saved stop on this trip.
+    html += '<span class="chain-dot saved"></span>' + skip(3) +
+            '<span class="chain-dot bus-here"></span>';
+  } else if (gap === 0) {
+    html += '<span class="chain-dot bus-here saved"></span>';
+  } else if (gap === 1) {
+    html += '<span class="chain-dot bus-here"></span>' +
+            '<span class="chain-dot saved"></span>';
+  } else if (gap === 2) {
+    html += '<span class="chain-dot bus-here"></span>' +
+            '<span class="chain-dot"></span>' +
+            '<span class="chain-dot saved"></span>';
+  } else if (gap === 3) {
+    // Bus, next, prev-of-saved, saved — nothing to hide yet.
+    html += '<span class="chain-dot bus-here"></span>' +
+            '<span class="chain-dot"></span>' +
+            '<span class="chain-dot"></span>' +
+            '<span class="chain-dot saved"></span>';
+  } else {
+    // gap >= 4: bus, next, [hidden cluster], prev-of-saved, saved.
+    const hidden = gap - 3;
+    const dots = Math.min(4, Math.max(2, hidden));
+    html += '<span class="chain-dot bus-here"></span>' +
+            '<span class="chain-dot"></span>' +
+            skip(dots) +
+            '<span class="chain-dot"></span>' +
+            '<span class="chain-dot saved"></span>';
+  }
+  html += '</div>';
+  return html;
 }
 
 function buildBusStrip(run, line, now) {
@@ -732,8 +947,55 @@ async function enableMap() {
                   stops:  L.layerGroup().addTo(map),
                   buses:  L.layerGroup().addTo(map) };
   }
+  // Leaflet measures its container at init. If we were hidden when it was
+  // first attached (or if the toggle was just flipped on), the container
+  // had zero size and tiles never paint. Force a remeasure now.
+  requestAnimationFrame(() => { if (map) map.invalidateSize(); });
   drawMapStatic();
   renderMap();
+}
+
+async function enableNearbyMap() {
+  const wrap = document.getElementById('nearby-map');
+  wrap.classList.remove('hidden');
+  if (!nearbyMap) {
+    await loadLeaflet();
+    nearbyMap = L.map('nearby-map', {
+      zoomControl: true, attributionControl: false,
+    }).setView([45.402, -75.642], 14);
+    nearbyTiles = L.tileLayer(TILES[prefs.theme] || TILES.light, {
+      maxZoom: 20, subdomains: 'abcd',
+    }).addTo(nearbyMap);
+    nearbyMapLayers = L.layerGroup().addTo(nearbyMap);
+  }
+  requestAnimationFrame(() => { if (nearbyMap) nearbyMap.invalidateSize(); });
+  drawNearbyMarkers();
+}
+
+function drawNearbyMarkers() {
+  if (!nearbyMap || !nearbyMapLayers) return;
+  nearbyMapLayers.clearLayers();
+  if (!lastNearbyResults) return;
+  const { me, items } = lastNearbyResults;
+  const bounds = [];
+  if (me) {
+    L.marker([me.lat, me.lon], {
+      icon: L.divIcon({ className: '', iconSize: [16, 16],
+        html: '<div class="nearby-pin me"></div>' }),
+    }).bindPopup('You are here').addTo(nearbyMapLayers);
+    bounds.push([me.lat, me.lon]);
+  }
+  for (const { sid, s } of (items || [])) {
+    L.marker([s.lat, s.lon], {
+      icon: L.divIcon({ className: '', iconSize: [14, 14],
+        html: '<div class="nearby-pin"></div>' }),
+    }).bindPopup(
+      `<strong>${esc(s.name)}</strong><br>Stop #${esc(s.code)}` +
+      ((s.r && s.r.length) ? `<br>Routes: ${esc(s.r.join(', '))}` : '')
+    ).addTo(nearbyMapLayers);
+    bounds.push([s.lat, s.lon]);
+  }
+  if (bounds.length) nearbyMap.fitBounds(bounds, { padding: [20, 20] });
 }
 
 function loadLeaflet() {
@@ -869,32 +1131,85 @@ function renderLinePicker() {
 
 /* ── Favourite stops ────────────────────────────────────────────────────── */
 function renderFavStops() {
+  renderStopGroups();
   const host = document.getElementById('fav-stops');
   host.innerHTML = '';
-  if (prefs.favStops.length === 0) {
-    host.innerHTML = `<div class="empty-mini">None yet — tap ★ on any stop in
-      an expanded timeline, or use “Find stops near me”.</div>`;
+  const stops = activeGroup().stopIds;
+  if (stops.length === 0) {
+    host.innerHTML = `<div class="empty-mini">No stops in “${esc(activeGroup().name)}”
+      yet — tap ★ on any stop in an expanded timeline, or use
+      “Find stops near me”.</div>`;
     return;
   }
-  for (const sid of prefs.favStops) {
+  for (const sid of stops) {
     const s = GTFS.stops[sid];
     if (!s) continue;
+    const live = favStopIsLive(sid);
     const row = document.createElement('div');
     row.className = 'fav-stop-row';
     row.innerHTML = `
+      <span class="fav-live ${live ? 'on' : ''}"
+            title="${live ? 'Live feed flowing for this stop'
+                          : 'Waiting for live data (route may not be selected)'}"></span>
       <span class="stop-code">#${esc(s.code)}</span>
       <span class="nm">${esc(s.name)}</span>
-      <button class="mini-x" title="Remove">✕</button>`;
+      <button class="mini-x" title="Remove from this group">✕</button>`;
     row.querySelector('.mini-x').onclick = () => toggleFav(sid);
     host.appendChild(row);
   }
 }
 
+function renderStopGroups() {
+  const host = document.getElementById('stop-groups');
+  if (!host) return;
+  host.innerHTML = '';
+  for (const g of prefs.stopGroups) {
+    const chip = document.createElement('span');
+    chip.className = 'group-chip' + (g.id === prefs.activeGroupId ? ' active' : '');
+    chip.setAttribute('role', 'button');
+    chip.tabIndex = 0;
+    chip.innerHTML = `
+      <span class="grp-name">${esc(g.name)}</span>
+      <span class="grp-count">${g.stopIds.length}</span>
+      <span class="grp-edit" title="Rename or delete this group">✎</span>`;
+    chip.addEventListener('click', (e) => {
+      if (e.target.classList.contains('grp-edit')) { editGroup(g.id); return; }
+      setActiveGroup(g.id);
+    });
+    chip.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault(); setActiveGroup(g.id);
+      }
+    });
+    host.appendChild(chip);
+  }
+  const add = document.createElement('button');
+  add.className = 'group-add';
+  add.textContent = '+ New group';
+  add.onclick = addGroup;
+  host.appendChild(add);
+}
+
+/* A saved stop is "live" iff at least one approaching trip has fresh data —
+   i.e. its route is selected, ETAs are flowing, and the vehicle (if any) was
+   heard from recently. */
+function favStopIsLive(sid) {
+  if (!lastData) return false;
+  const now = serverNow();
+  for (const run of runs) {
+    const t = run.etas.get(sid);
+    if (t == null || t < now - 30) continue;
+    if (!run.feedTs || (now - run.feedTs) < STALE_VEHICLE) return true;
+  }
+  return false;
+}
+
 function toggleFav(sid) {
-  if (prefs.favStops.includes(sid))
-    prefs.favStops = prefs.favStops.filter(s => s !== sid);
-  else
-    prefs.favStops.push(sid);
+  const g = activeGroup();
+  const i = g.stopIds.indexOf(sid);
+  if (i >= 0) g.stopIds.splice(i, 1);
+  else g.stopIds.push(sid);
+  syncActiveStops();
   savePrefs();
   renderFavStops();
   renderDeparturesBoard();
@@ -904,8 +1219,10 @@ function toggleFav(sid) {
 /* ── Nearby stops (geolocation) ─────────────────────────────────────────── */
 function findNearby() {
   const list = document.getElementById('nearby-list');
+  const controls = document.getElementById('nearby-controls');
   if (!navigator.geolocation) { toast('Geolocation not available.'); return; }
   list.innerHTML = '<div class="empty-mini">Locating…</div>';
+  if (controls) controls.classList.remove('hidden');
 
   navigator.geolocation.getCurrentPosition((pos) => {
     const { latitude, longitude } = pos.coords;
@@ -913,6 +1230,7 @@ function findNearby() {
       .map(([sid, s]) => ({ sid, s, d: haversine(latitude, longitude, s.lat, s.lon) }))
       .sort((a, b) => a.d - b.d)
       .slice(0, 8);
+    lastNearbyResults = { me: { lat: latitude, lon: longitude }, items: ranked };
 
     list.innerHTML = '';
     for (const { sid, s, d } of ranked) {
@@ -931,6 +1249,7 @@ function findNearby() {
       };
       list.appendChild(item);
     }
+    if (prefs.nearbyOnMap) enableNearbyMap();
   }, (err) => {
     list.innerHTML = `<div class="empty-mini">Location error: ${esc(err.message)}</div>`;
   }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
