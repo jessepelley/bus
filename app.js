@@ -746,9 +746,8 @@ function predictVehiclePosition(run) {
       const proj = projectOnShape(idx, v.lat, v.lon);
       // If the GPS is wildly off the shape, fall back to dead reckoning.
       if (proj.deviation < 250) {
-        const speed = (v.speed != null && v.speed > 0)
-          ? v.speed
-          : estimateSpeedFromHistory(run.vehId, v) || 8;   // 8 m/s ~ 29 km/h
+        const est = estimateCurrentSpeed(run, idx, now);
+        const speed = est.speed != null ? est.speed : 8;   // 8 m/s ~ 29 km/h
         const advanced = proj.offset + speed * dt;
         const [lat, lon] = offsetToLatLon(idx, advanced);
         out.lat = lat; out.lon = lon;
@@ -756,40 +755,117 @@ function predictVehiclePosition(run) {
         out.method = 'shape';
         out.predOffset = advanced;
         out.shapeId = run.line.pattern.shape;
+        out.speed = speed;
+        out.speedSource = est.source;
         return out;
       }
     }
   }
 
-  // 2) Dead reckoning by bearing + speed.
-  if (v.bearing != null && v.speed != null && v.speed > 0) {
-    const R = 6371000;
-    const br = v.bearing * Math.PI / 180;
-    const d = v.speed * dt / R;
-    const φ1 = v.lat * Math.PI / 180;
-    const λ1 = v.lon * Math.PI / 180;
-    const φ2 = Math.asin(Math.sin(φ1) * Math.cos(d) +
-                         Math.cos(φ1) * Math.sin(d) * Math.cos(br));
-    const λ2 = λ1 + Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(φ1),
-                               Math.cos(d) - Math.sin(φ1) * Math.sin(φ2));
-    out.lat = φ2 * 180 / Math.PI;
-    out.lon = λ2 * 180 / Math.PI;
-    out.predicted = true;
-    out.method = 'bearing';
+  // 2) Dead reckoning by bearing + a blended speed.
+  if (v.bearing != null) {
+    const est = estimateCurrentSpeed(run, null, now);
+    if (est.speed != null && est.speed > 0) {
+      const R = 6371000;
+      const br = v.bearing * Math.PI / 180;
+      const d = est.speed * dt / R;
+      const φ1 = v.lat * Math.PI / 180;
+      const λ1 = v.lon * Math.PI / 180;
+      const φ2 = Math.asin(Math.sin(φ1) * Math.cos(d) +
+                           Math.cos(φ1) * Math.sin(d) * Math.cos(br));
+      const λ2 = λ1 + Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(φ1),
+                                 Math.cos(d) - Math.sin(φ1) * Math.sin(φ2));
+      out.lat = φ2 * 180 / Math.PI;
+      out.lon = λ2 * 180 / Math.PI;
+      out.predicted = true;
+      out.method = 'bearing';
+      out.speed = est.speed;
+      out.speedSource = est.source;
+    }
   }
   return out;
 }
 
-/* Compute speed from the last two recorded positions when the feed omits it
-   (some vehicles only report position). Returns m/s or null. */
-function estimateSpeedFromHistory(vehId, v) {
-  const hist = vehicleHistory.get(vehId);
-  if (!hist || hist.length < 2) return null;
-  const a = hist[hist.length - 2], b = hist[hist.length - 1];
-  const dt = b.t - a.t;
-  if (dt < 5 || dt > 300) return null;
-  const d = haversine(a.lat, a.lon, b.lat, b.lon);
-  return d / dt;
+/* Blended speed estimate that takes traffic into account.
+
+   Sources, in order of preference:
+     1. Trailing average over the last ~90 s of GPS samples, measured along
+        the route polyline (so winding sections don't under-count distance).
+        This naturally reflects current traffic conditions — a bus crawling
+        through congestion has a low trailing average; a bus on the
+        Transitway has a high one.
+     2. Instantaneous GPS speed reported by the bus's chip.
+     3. Schedule-implied speed (from this segment's distance ÷ scheduled
+        travel time) when there's no other signal.
+
+   Overrides:
+   - If the bus is reporting instantaneous speed of 0 right now, return 0
+     even if the trailing average is non-zero — it just stopped.
+   - When trailing average and instantaneous disagree by ≥50%, we trust the
+     one suggesting LESS motion (safer to under-predict than to fly the
+     ghost ahead of where the bus actually is). */
+function estimateCurrentSpeed(run, shapeIdx, now) {
+  const v = run && run.vehicle;
+  const inst = v && v.speed != null && v.speed >= 0 ? v.speed : null;
+  if (inst === 0) return { speed: 0, source: 'stopped' };
+
+  // Trailing-window average from history.
+  const hist = vehicleHistory.get(run.vehId) || [];
+  const recent = hist.filter(p => (now - p.t) <= 90);
+  let trailing = null;
+  if (recent.length >= 2) {
+    const a = recent[0], b = recent[recent.length - 1];
+    const dt = b.t - a.t;
+    if (dt >= 10) {
+      let d;
+      if (shapeIdx) {
+        const oA = projectOnShape(shapeIdx, a.lat, a.lon).offset;
+        const oB = projectOnShape(shapeIdx, b.lat, b.lon).offset;
+        d = Math.max(0, oB - oA);
+      } else {
+        d = haversine(a.lat, a.lon, b.lat, b.lon);
+      }
+      // Buses don't exceed ~25 m/s (90 km/h); reject obvious noise.
+      const s = d / dt;
+      if (s >= 0 && s <= 30) trailing = s;
+    }
+  }
+
+  if (trailing != null && inst != null) {
+    // Disagreement: take the smaller value. Under-predicting keeps the
+    // ghost behind reality (the GPS fix will catch up), which reads better
+    // than the ghost overshooting and snapping backwards.
+    if (Math.abs(trailing - inst) > Math.max(trailing, inst) * 0.5) {
+      return { speed: Math.min(trailing, inst), source: 'min(hist,inst)' };
+    }
+    // Otherwise weighted: trailing leads (more stable), inst tops up.
+    return { speed: 0.65 * trailing + 0.35 * inst, source: 'blended' };
+  }
+  if (trailing != null) return { speed: trailing, source: 'history' };
+  if (inst != null)     return { speed: inst,     source: 'instant'  };
+
+  // Last resort: schedule-implied speed for this run's current segment.
+  const sched = scheduleImpliedSpeed(run, now);
+  if (sched != null) return { speed: sched, source: 'schedule' };
+  return { speed: null, source: 'none' };
+}
+
+/* From the run's StopTimeUpdates, infer the speed the bus is *expected* to
+   move at right now: distance to its next stop ÷ time until predicted
+   arrival. Useful when the bus has just appeared and we have no GPS history
+   yet. */
+function scheduleImpliedSpeed(run, now) {
+  if (!run.nextStopId || !run.vehicle) return null;
+  const eta = run.etas.get(run.nextStopId);
+  if (!eta || eta <= now) return null;
+  const nextStop = GTFS.stops[run.nextStopId];
+  if (!nextStop) return null;
+  const d = haversine(run.vehicle.lat, run.vehicle.lon,
+                      nextStop.lat, nextStop.lon);
+  const dt = eta - now;
+  if (dt < 5 || dt > 1800) return null;
+  const s = d / dt;
+  return (s >= 0 && s <= 30) ? s : null;
 }
 
 /* Maintain a small ring buffer of recent positions per vehicle id so we can

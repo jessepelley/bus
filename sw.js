@@ -5,7 +5,7 @@
    Per-route files (data/routes/<id>.json) are not pre-cached — they are
    fetched on demand and then kept by the stale-while-revalidate handler
    below, so only the routes a visitor actually opens are stored. */
-const CACHE = 'busjjjp-v4';
+const CACHE = 'busjjjp-v5';
 const SHELL = [
   './', './index.html', './app.js', './auth.js', './styles.css',
   './manifest.json', './favicon.svg', './icon.svg',

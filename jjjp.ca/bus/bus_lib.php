@@ -223,20 +223,23 @@ function bus_fetch_feed($path, $maxAge)
         // succeeds first is what we serve, and the diag modal records which.
         //
         //   1. UTF-8 substitute       — one rogue byte in a stop name.
-        //   2. Strip ASCII control chars (except \t\n\r) — OC Transpo's JSON
-        //      sometimes ships unescaped NUL/VT inside string values, which
-        //      is spec-noncompliant and breaks json_decode by design.
+        //   2. Strip ALL ASCII control chars (0x00–0x1F, including \t\n\r)
+        //      — OC Transpo's JSON sometimes ships those bytes unescaped
+        //      inside string values, which is spec-noncompliant and trips
+        //      json_decode's JSON_ERROR_CTRL_CHAR. Stripping them globally is
+        //      safe even when they were legitimate token-separating whitespace,
+        //      because JSON tolerates zero whitespace between tokens.
         //   3. Both at once           — belt and braces.
         $tol = json_decode($res['body'], true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
         $recoveryStep = $tol !== null ? 'utf8' : '';
 
         if ($tol === null) {
-            $stripped = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $res['body']);
+            $stripped = preg_replace('/[\x00-\x1F]/', '', $res['body']);
             $tol = json_decode($stripped, true);
             if (is_array($tol)) $recoveryStep = 'stripped';
         }
         if ($tol === null) {
-            $stripped = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $res['body']);
+            $stripped = preg_replace('/[\x00-\x1F]/', '', $res['body']);
             $tol = json_decode($stripped, true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
             if (is_array($tol)) $recoveryStep = 'stripped+utf8';
         }
