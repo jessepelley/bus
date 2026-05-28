@@ -219,21 +219,41 @@ function bus_fetch_feed($path, $maxAge)
         // the diag modal can show it.
         $whyStrict = json_last_error_msg();
 
-        // Try again tolerantly — substitute bad UTF-8 with the Unicode
-        // replacement char. If the only issue is one rogue byte in a stop
-        // name, this recovers gracefully and the app keeps running.
+        // Recovery cascade. Each step tries one tolerant strategy; whichever
+        // succeeds first is what we serve, and the diag modal records which.
+        //
+        //   1. UTF-8 substitute       — one rogue byte in a stop name.
+        //   2. Strip ASCII control chars (except \t\n\r) — OC Transpo's JSON
+        //      sometimes ships unescaped NUL/VT inside string values, which
+        //      is spec-noncompliant and breaks json_decode by design.
+        //   3. Both at once           — belt and braces.
         $tol = json_decode($res['body'], true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
-        if (is_array($tol)) {
-            file_put_contents($cacheFile, $res['body'], LOCK_EX);
-            bus_log_fetch($path, $res['code'] ?: 200, $res['ms'],
-                          'recovered · ' . $whyStrict);
-            return ['data' => $tol, 'age' => 0, 'stale' => false,
-                    'source' => 'fresh', 'http' => $res['code'] ?: 200,
-                    'err' => 'recovered · ' . $whyStrict, 'ms' => $res['ms']];
+        $recoveryStep = $tol !== null ? 'utf8' : '';
+
+        if ($tol === null) {
+            $stripped = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $res['body']);
+            $tol = json_decode($stripped, true);
+            if (is_array($tol)) $recoveryStep = 'stripped';
+        }
+        if ($tol === null) {
+            $stripped = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $res['body']);
+            $tol = json_decode($stripped, true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
+            if (is_array($tol)) $recoveryStep = 'stripped+utf8';
         }
 
-        // Still no good — record the json error + body tail so we can see
-        // whether it's truncation, a control char, etc.
+        if (is_array($tol)) {
+            // Cache the ORIGINAL body so the next request can also try the
+            // strict parse first (in case the issue was transient).
+            file_put_contents($cacheFile, $res['body'], LOCK_EX);
+            $note = 'recovered (' . $recoveryStep . ') · ' . $whyStrict;
+            bus_log_fetch($path, $res['code'] ?: 200, $res['ms'], $note);
+            return ['data' => $tol, 'age' => 0, 'stale' => false,
+                    'source' => 'fresh', 'http' => $res['code'] ?: 200,
+                    'err' => $note, 'ms' => $res['ms']];
+        }
+
+        // Still no good after every tolerance step — record everything we
+        // know so the cause is unambiguous (control char vs. truncation).
         $res['err'] = 'json parse failed · ' . $whyStrict . ' · ' .
                       bus_describe_body($res['body'], $res['ctype'] ?? '') .
                       ' · tail=' . bus_body_tail($res['body']);

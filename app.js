@@ -1039,6 +1039,35 @@ function renderNow() {
   renderNowBoard();
   renderNowStatus();
   renderNowRoutes();
+  renderNowLegend();
+}
+
+/* Tiny collapsible legend explaining the colour / live semantics. Rendered
+   only once — its content is static, so we just check whether it exists. */
+function renderNowLegend() {
+  let host = document.getElementById('now-legend');
+  if (!host) {
+    host = document.createElement('details');
+    host.id = 'now-legend';
+    host.className = 'now-legend';
+    document.querySelector('.tab-pane[data-tab="now"]').appendChild(host);
+  }
+  host.innerHTML = `
+    <summary>What do the colours and icon mean?</summary>
+    <div class="legend-rows">
+      <div><span class="legend-eta now">due</span>
+           the bus is within 45 seconds</div>
+      <div><span class="legend-eta soon">soon</span>
+           1–6 minutes away — start moving</div>
+      <div><span class="legend-eta later">later</span>
+           more than 6 minutes away</div>
+      <div><span class="legend-icon">${liveIcon()}</span>
+           live — a vehicle is reporting GPS for this trip and the
+           ETA is GPS-informed</div>
+      <div><span class="legend-icon legend-icon-blank"></span>
+           no icon — the ETA is based on the schedule because no bus is yet
+           assigned to the trip (or its GPS went stale)</div>
+    </div>`;
 }
 
 function renderNowAlert() {
@@ -1129,14 +1158,14 @@ function renderNowBoard() {
         <div class="now-primary">
           ${badge(first.run)}
           <span class="now-headsign">${esc(first.run.headsign)}</span>
-          ${nowEta(first.t, now)}
+          ${nowEta(first.t, now, isRunLive(first.run, now))}
         </div>
         ${ghostStripFor(first.run, sid, now)}
         ${remaining.length ? `<div class="now-next">${
           remaining.map(a => `<div class="now-next-row">
             ${badge(a.run)}
             <span class="now-headsign">${esc(a.run.headsign)}</span>
-            ${nowEta(a.t, now)}
+            ${nowEta(a.t, now, isRunLive(a.run, now))}
           </div>`).join('')
         }</div>` : ''}`;
     }
@@ -1218,12 +1247,41 @@ function ghostStripFor(run, savedSid, now) {
     </div>`;
 }
 
-function nowEta(t, now) {
+function nowEta(t, now, live) {
   const sec = t - now;
   const cls = sec < 45 ? 'now' : (sec < 6 * 60 ? 'soon' : 'later');
-  return `<span class="now-eta ${cls}">
-    <span class="now-eta-big">${fmtEta(sec)}</span>
+  return `<span class="now-eta ${cls}${live ? ' is-live' : ''}"
+                 title="${live ? 'GPS-confirmed in the last 2½ min'
+                              : 'Schedule-based prediction — no live GPS for this trip'}">
+    <span class="eta-line">
+      ${live ? liveIcon() : ''}
+      <span class="now-eta-big">${fmtEta(sec)}</span>
+    </span>
     <small>${fmtClock(t)}</small></span>`;
+}
+
+/* Is this run currently being tracked by GPS? A vehicle is "live" iff the
+   trip update has a vehicle attached AND the position was reported within
+   the staleness window. Schedule-only predictions (no vehicle yet) are
+   distinguished visually so the user knows not to fully trust the ETA. */
+function isRunLive(run, now) {
+  if (!run.vehicle) return false;
+  const ts = run.vehicle.ts || run.feedTs;
+  if (!ts) return false;
+  return (now - ts) < STALE_VEHICLE;
+}
+
+/* Compact RSS-style broadcast icon — a dot with two arcs that pulse outward,
+   colour-inherited from .now-eta.is-live (green by default).  */
+function liveIcon() {
+  return `<svg class="live-rss" viewBox="0 0 16 16" aria-label="GPS-confirmed"
+               role="img">
+    <circle cx="3.5" cy="12.5" r="1.5" class="rss-base"/>
+    <path d="M3 9 A 5 5 0 0 1 7 13" fill="none" stroke-width="1.6"
+          stroke-linecap="round" class="rss-near"/>
+    <path d="M3 5 A 9 9 0 0 1 11 13" fill="none" stroke-width="1.6"
+          stroke-linecap="round" class="rss-far"/>
+  </svg>`;
 }
 
 function renderNowStatus() {
@@ -1567,57 +1625,71 @@ function buildStopMiniStrip(savedSid, line, lineRuns, stops, now) {
       <span class="stop-code-tag">#${esc(stop.code)}</span>
       <span class="mini-eta ${etaCls}">${esc(etaText)}</span>
     </div>
-    ${buildMiniChain(busIdx, savedIdx)}`;
+    ${buildMiniChain(busIdx, savedIdx, stops)}`;
   return strip;
 }
 
-/* The visual symbol the user asked for:
-   bus • next-stop  ···(hidden)···  prev-of-saved • saved.
-   Big dots = visible stops, tiny clustered dots = omitted stops. */
-function buildMiniChain(busIdx, savedIdx) {
-  let html = '<div class="mini-chain">';
+/* The compact mini-chain visualises a slice of the route between the bus and
+   the saved stop. We want it to show as MANY intermediate stops as will fit
+   on a line — so the user can see "is the bus past Hurdman yet?" at a glance.
+   Only when the gap exceeds available width do we collapse the middle with a
+   ··· cluster, keeping the stops nearest the bus and nearest the saved stop
+   both visible (since those are the contextual anchors). */
+function buildMiniChain(busIdx, savedIdx, stops) {
   if (busIdx < 0) {
-    html += '<span class="chain-dot saved"></span>';
-    html += '</div>';
-    return html;
+    return '<div class="mini-chain"><span class="chain-dot saved"></span></div>';
   }
-  const gap = savedIdx - busIdx;
-  const skip = (n) => {
-    let s = '<span class="chain-skip">';
-    for (let i = 0; i < n; i++) s += '<span class="skip-dot"></span>';
-    return s + '</span>';
+
+  // How many dots will fit horizontally? Each dot reserves ~28px; the strip
+  // sits inside a card whose inner width depends on viewport. This is a
+  // viewport-based estimate — measuring DOM here would force layout.
+  const maxSlots = miniChainSlotCount();
+
+  const lo = Math.min(busIdx, savedIdx);
+  const hi = Math.max(busIdx, savedIdx);
+  const span = hi - lo + 1;
+
+  const dot = (idx) => {
+    const name = stops ? (GTFS.stops[stops[idx]] || {}).name : '';
+    const cls = ['chain-dot'];
+    if (idx === busIdx)   cls.push('bus-here');
+    if (idx === savedIdx) cls.push('saved');
+    const title = name ? ` title="${esc(name)}"` : '';
+    return `<span class="${cls.join(' ')}"${title}></span>`;
   };
-  if (gap < 0) {
-    // Bus already past the saved stop on this trip.
-    html += '<span class="chain-dot saved"></span>' + skip(3) +
-            '<span class="chain-dot bus-here"></span>';
-  } else if (gap === 0) {
-    html += '<span class="chain-dot bus-here saved"></span>';
-  } else if (gap === 1) {
-    html += '<span class="chain-dot bus-here"></span>' +
-            '<span class="chain-dot saved"></span>';
-  } else if (gap === 2) {
-    html += '<span class="chain-dot bus-here"></span>' +
-            '<span class="chain-dot"></span>' +
-            '<span class="chain-dot saved"></span>';
-  } else if (gap === 3) {
-    // Bus, next, prev-of-saved, saved — nothing to hide yet.
-    html += '<span class="chain-dot bus-here"></span>' +
-            '<span class="chain-dot"></span>' +
-            '<span class="chain-dot"></span>' +
-            '<span class="chain-dot saved"></span>';
+
+  let html = '<div class="mini-chain">';
+
+  if (span <= maxSlots) {
+    // Whole slice fits — show every stop between bus and saved.
+    for (let i = lo; i <= hi; i++) html += dot(i);
   } else {
-    // gap >= 4: bus, next, [hidden cluster], prev-of-saved, saved.
-    const hidden = gap - 3;
-    const dots = Math.min(4, Math.max(2, hidden));
-    html += '<span class="chain-dot bus-here"></span>' +
-            '<span class="chain-dot"></span>' +
-            skip(dots) +
-            '<span class="chain-dot"></span>' +
-            '<span class="chain-dot saved"></span>';
+    // Need to condense. The cluster takes one slot; allocate the rest as
+    // ⌈half⌉ near the bus and ⌊half⌋ near the saved stop. The bus is what
+    // the user is tracking moment-to-moment, so it gets the extra slot.
+    const headCount = Math.ceil((maxSlots - 1) / 2);
+    const tailCount = (maxSlots - 1) - headCount;
+    const hidden = span - headCount - tailCount;
+
+    for (let i = 0; i < headCount; i++) html += dot(lo + i);
+    html += `<span class="chain-skip" title="${hidden} stops hidden">` +
+            '<span class="skip-dot"></span><span class="skip-dot"></span>' +
+            '<span class="skip-dot"></span></span>';
+    for (let i = tailCount - 1; i >= 0; i--) html += dot(hi - i);
   }
+
   html += '</div>';
   return html;
+}
+
+/* How many dot-slots fit in a mini-chain at the current viewport size?
+   Tuned against the card's inner width (sidebar takes 312px on desktop). */
+function miniChainSlotCount() {
+  const w = window.innerWidth;
+  // Card inner width ≈ viewport - sidebar(312 if desktop) - paddings(~32)
+  const inner = w > 760 ? Math.max(280, w - 360) : Math.max(220, w - 80);
+  // Each slot needs ~26-30px (dot + margins). Keep within a sensible range.
+  return Math.max(6, Math.min(22, Math.floor(inner / 28)));
 }
 
 function buildBusStrip(run, line, now) {
