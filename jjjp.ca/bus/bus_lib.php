@@ -86,17 +86,24 @@ function bus_http_get($url, array $headers)
  * HTTP GET with detailed status — returns body + http code + curl/transport error.
  * Same semantics as bus_http_get() but always reports the failure reason so the
  * diagnostics endpoint can show *why* an upstream fetch did not return a body.
+ * Also captures Content-Type and a length so we can diagnose "200 but wrong body".
  */
 function bus_http_get_detail($url, array $headers)
 {
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
+        $respHeaders = [];
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => $headers,
             CURLOPT_TIMEOUT        => UPSTREAM_TIMEOUT,
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_HEADERFUNCTION => function ($ch, $h) use (&$respHeaders) {
+                if (preg_match('/^([^:]+):\s*(.+?)\s*$/i', $h, $m))
+                    $respHeaders[strtolower($m[1])] = $m[2];
+                return strlen($h);
+            },
         ]);
         $body = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -109,6 +116,8 @@ function bus_http_get_detail($url, array $headers)
             'err'  => $err ?: ($body === false ? 'transport failure' :
                               ($code >= 400 ? 'HTTP ' . $code : '')),
             'ms'   => (int) round(($total ?: 0) * 1000),
+            'ctype' => $respHeaders['content-type'] ?? '',
+            'len'   => $body === false ? 0 : strlen($body),
         ];
     }
     $ctx = stream_context_create(['http' => [
@@ -118,10 +127,11 @@ function bus_http_get_detail($url, array $headers)
     $t0 = microtime(true);
     $body = @file_get_contents($url, false, $ctx);
     $ms = (int) round((microtime(true) - $t0) * 1000);
-    $code = 0;
-    if (isset($http_response_header[0]) &&
-        preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) {
-        $code = (int) $m[1];
+    $code = 0; $ctype = '';
+    foreach ($http_response_header ?? [] as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d+)#', $h, $m)) $code = (int) $m[1];
+        elseif (stripos($h, 'content-type:') === 0)
+            $ctype = trim(substr($h, strlen('content-type:')));
     }
     return [
         'body' => ($body !== false && $code >= 200 && $code < 300) ? $body : null,
@@ -129,7 +139,44 @@ function bus_http_get_detail($url, array $headers)
         'err'  => $body === false ? 'transport failure'
                  : ($code >= 400 ? 'HTTP ' . $code : ''),
         'ms'   => $ms,
+        'ctype' => $ctype,
+        'len'   => $body === false ? 0 : strlen($body),
     ];
+}
+
+/** Last ~80 chars of the body, control chars escaped. If the body is
+ *  truncated mid-object the tail won't be the proper closing braces. */
+function bus_body_tail($body)
+{
+    if ($body === null || $body === '') return '';
+    $tail = substr($body, -96);
+    return preg_replace_callback('/[\x00-\x1F\x7F]/',
+        function ($m) { return sprintf('\\x%02x', ord($m[0])); },
+        $tail);
+}
+
+/** Compact, log-safe representation of an unexpected response body —
+ *  helps tell "HTML error page" from "binary protobuf" from "truncated json". */
+function bus_describe_body($body, $ctype)
+{
+    if ($body === null || $body === false || $body === '') return 'empty';
+    $len = strlen($body);
+    $head = substr($body, 0, 96);
+    $printable = preg_replace('/[^\x20-\x7E]/', '.', $head);
+    $isBinary = strlen(preg_replace('/[^\x09\x0A\x0D\x20-\x7E]/', '', $head)) < strlen($head) * 0.85;
+    $shape = $isBinary ? 'binary' : 'text';
+    if (!$isBinary) {
+        if (preg_match('/^\s*<!doctype html|^\s*<html|^\s*<\?xml/i', $head)) $shape = 'html/xml';
+        elseif (preg_match('/^\s*[\{\[]/', $head)) $shape = 'json-ish';
+    }
+    return sprintf(
+        '%s · %s · %d bytes · head=%s%s',
+        $shape,
+        $ctype !== '' ? $ctype : 'no content-type',
+        $len,
+        substr($printable, 0, 64),
+        $len > 64 ? '…' : ''
+    );
 }
 
 /**
@@ -157,7 +204,8 @@ function bus_fetch_feed($path, $maxAge)
     }
 
     $res = bus_http_get_detail(OCT_BASE . '/' . $path . '?format=json',
-                               ['Ocp-Apim-Subscription-Key: ' . OCT_KEY]);
+                               ['Ocp-Apim-Subscription-Key: ' . OCT_KEY,
+                                'Accept: application/json']);
     if ($res['body'] !== null) {
         $data = json_decode($res['body'], true);
         if (is_array($data)) {
@@ -167,8 +215,28 @@ function bus_fetch_feed($path, $maxAge)
                     'source' => 'fresh', 'http' => $res['code'] ?: 200,
                     'err' => '', 'ms' => $res['ms']];
         }
-        // Body came back but did not parse — treat as a failure.
-        $res['err'] = $res['err'] ?: 'json parse failed';
+        // Strict parse failed. Capture *what* json_decode complained about so
+        // the diag modal can show it.
+        $whyStrict = json_last_error_msg();
+
+        // Try again tolerantly — substitute bad UTF-8 with the Unicode
+        // replacement char. If the only issue is one rogue byte in a stop
+        // name, this recovers gracefully and the app keeps running.
+        $tol = json_decode($res['body'], true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
+        if (is_array($tol)) {
+            file_put_contents($cacheFile, $res['body'], LOCK_EX);
+            bus_log_fetch($path, $res['code'] ?: 200, $res['ms'],
+                          'recovered · ' . $whyStrict);
+            return ['data' => $tol, 'age' => 0, 'stale' => false,
+                    'source' => 'fresh', 'http' => $res['code'] ?: 200,
+                    'err' => 'recovered · ' . $whyStrict, 'ms' => $res['ms']];
+        }
+
+        // Still no good — record the json error + body tail so we can see
+        // whether it's truncation, a control char, etc.
+        $res['err'] = 'json parse failed · ' . $whyStrict . ' · ' .
+                      bus_describe_body($res['body'], $res['ctype'] ?? '') .
+                      ' · tail=' . bus_body_tail($res['body']);
     }
 
     bus_log_fetch($path, $res['code'], $res['ms'], $res['err'] ?: 'no body');

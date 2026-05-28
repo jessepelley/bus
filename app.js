@@ -153,7 +153,10 @@ function registerServiceWorker() {
 /* ── Bundled data: light index now, per-route detail on demand ──────────── */
 
 /* One LINES entry per route:direction, from the lightweight index. The
-   `pattern` (stop list + shape) is null until the route's file is loaded. */
+   `pattern` (stop list + shape) is null until the route's file is loaded.
+   For two-direction routes we also synthesise a `<route>:loop` entry so the
+   user can opt into a merged view (e.g. Route 45, which is physically a loop
+   even though GTFS models it as two directions). */
 function buildLinesFromIndex() {
   for (const [rid, route] of Object.entries(GTFS.routes)) {
     route.patterns = route.patterns || [];
@@ -164,6 +167,16 @@ function buildLinesFromIndex() {
         short: route.short, long: route.long,
         color: '#' + route.color, text: '#' + route.text,
         headsign: d.headsign, pattern: null,
+      });
+    }
+    if ((route.dirs || []).length === 2) {
+      const lk = rid + ':loop';
+      LINES.set(lk, {
+        key: lk, routeId: rid, dir: 'loop', isLoop: true,
+        short: route.short, long: route.long,
+        color: '#' + route.color, text: '#' + route.text,
+        headsign: route.dirs[0].headsign + ' ↔ ' + route.dirs[1].headsign,
+        pattern: null,
       });
     }
   }
@@ -199,7 +212,8 @@ function loadRouteData(rid) {
 }
 
 /* Index PATTERNS and fill each LINES entry's representative pattern (the
-   longest one per direction) once a route's detail file has arrived. */
+   longest one per direction) once a route's detail file has arrived. Also
+   builds the merged-loop pattern when both directions are present. */
 function prepareRoute(rid) {
   const route = GTFS.routes[rid];
   const byDir = {};
@@ -220,6 +234,36 @@ function prepareRoute(rid) {
     }
     line.pattern = pat;
     line.headsign = pat.headsign;
+  }
+
+  // Loop pattern: stitch dir 0 + dir 1 into one path. The bridge stop (last of
+  // dir 0 == first of dir 1) is deduped so it appears once on the merged
+  // timeline. The shape concatenates, so polyline projection traverses both
+  // legs without a discontinuity for vehicles transitioning between trips.
+  const loopKey = rid + ':loop';
+  const loopLine = LINES.get(loopKey);
+  if (loopLine && byDir[0] && byDir[1]) {
+    const a = byDir[0], b = byDir[1];
+    const aStops = a.stops, bStops = b.stops;
+    const stops = aStops.concat(
+      bStops[0] === aStops[aStops.length - 1] ? bStops.slice(1) : bStops);
+    const shapeA = GTFS.shapes[a.shape] || [];
+    const shapeB = GTFS.shapes[b.shape] || [];
+    const shapeId = '__loop_' + rid;
+    GTFS.shapes[shapeId] = shapeA.concat(shapeB);
+    shapeIndex.delete(shapeId);              // invalidate any stale cum table
+
+    loopLine.pattern = {
+      id: '__loop_pat_' + rid,
+      route: rid,
+      dir: 'loop',
+      headsign: loopLine.headsign,
+      shape: shapeId,
+      stops,
+      trip_count: (a.trip_count || 0) + (b.trip_count || 0),
+      isLoop: true,
+      bridgeIdx: aStops.length - 1,           // where dir-0 ends / dir-1 begins
+    };
   }
 }
 
@@ -883,6 +927,19 @@ function buildRuns() {
   }
 }
 
+/* All runs that should appear on a given line. For loop lines this returns
+   runs from BOTH underlying directions, so the merged timeline shows every
+   bus on the route — whether currently inbound or outbound. */
+function runsForLine(lineKey) {
+  const line = LINES.get(lineKey);
+  if (!line) return [];
+  if (line.isLoop) {
+    const a = line.routeId + ':0', b = line.routeId + ':1';
+    return runs.filter(r => r.lineKey === a || r.lineKey === b);
+  }
+  return runs.filter(r => r.lineKey === lineKey);
+}
+
 function lineKeyForTrip(tr) {
   const patId = GTFS.trip_patterns[tr.trip];
   if (patId && PATTERNS.has(patId)) {
@@ -1200,7 +1257,7 @@ function renderNowRoutes() {
   for (const key of prefs.lines) {
     const line = LINES.get(key);
     if (!line) continue;
-    const lineRuns = runs.filter(r => r.lineKey === key);
+    const lineRuns = runsForLine(key);
     const stats = statsByRoute[line.routeId];
     const today = stats && stats.available && stats.by_day && stats.by_day[0];
     const otp = today && today.measured > 0 ? today.on_time_pct : null;
@@ -1209,7 +1266,8 @@ function renderNowRoutes() {
     row.className = 'now-route';
     row.innerHTML = `
       ${badge({ short: line.short, color: line.color })}
-      <div class="now-route-title">→ ${esc(line.headsign)}</div>
+      <div class="now-route-title">${line.isLoop ? '↔' : '→'}
+        ${esc(line.headsign)}</div>
       <div class="now-route-meta">
         ${lineRuns.length} bus${lineRuns.length === 1 ? '' : 'es'}
         ${otp != null ? ` · ${otp}% on time` : ''}
@@ -1253,22 +1311,35 @@ function updateRailBusPositions() {
     const line = LINES.get(lineKey);
     if (!line || !line.pattern) return;
     const stops = line.pattern.stops;
-    const lineRuns = runs.filter(r => r.lineKey === lineKey);
+    const lineRuns = runsForLine(lineKey);
     const now = serverNow();
     lineRuns.forEach(run => {
       const marker = body.querySelector('.bus-marker[data-vid="' +
         cssEscape(run.vehId) + '"]');
       if (!marker) return;
-      const pos = computeRailPosition(run, stops, now);
+      const pos = computeRailPosition(run, stops, now, line);
       if (pos == null) return;
       marker.style.top = (pos * H + H / 2) + 'px';
     });
   });
 }
 
+/* Where in `stops` does this run's next stop sit? For loop timelines we may
+   have to search the second half (dir 1) explicitly — otherwise indexOf would
+   return a dir-0 occurrence if both halves share a stop id. */
+function stopIndexForRun(run, stops, line) {
+  if (!run.nextStopId) return -1;
+  if (line && line.isLoop && line.pattern && line.pattern.bridgeIdx != null &&
+      run.line && run.line.dir === 1) {
+    const i = stops.indexOf(run.nextStopId, line.pattern.bridgeIdx);
+    if (i >= 0) return i;
+  }
+  return stops.indexOf(run.nextStopId);
+}
+
 /* Where on the rail (in fractional stop-row units) should this run draw? */
-function computeRailPosition(run, stops, now) {
-  let nextIdx = run.nextStopId ? stops.indexOf(run.nextStopId) : -1;
+function computeRailPosition(run, stops, now, line) {
+  let nextIdx = stopIndexForRun(run, stops, line);
   if (nextIdx < 0 && run.vehicle && run.vehicle.lat != null)
     nextIdx = nearestStopIndex(stops, run.vehicle.lat, run.vehicle.lon);
   if (nextIdx < 0) return null;
@@ -1340,7 +1411,7 @@ function buildTimelineCard(line) {
     return card;
   }
 
-  const lineRuns = runs.filter(r => r.lineKey === line.key);
+  const lineRuns = runsForLine(line.key);
   const expanded = expandedCards.has(line.key);
 
   const card = document.createElement('div');
@@ -1348,11 +1419,12 @@ function buildTimelineCard(line) {
 
   const head = document.createElement('div');
   head.className = 'timeline-head';
+  const titlePrefix = line.isLoop ? '↔' : '→';
   head.innerHTML = `
     <span class="tl-chevron">▶</span>
     <span class="route-badge" style="background:${line.color};color:${line.text}">
       ${esc(line.short)}</span>
-    <span class="tl-title">→ ${esc(line.headsign)}</span>
+    <span class="tl-title">${titlePrefix} ${esc(line.headsign)}</span>
     <span class="tl-sub">${lineRuns.length} bus${lineRuns.length === 1 ? '' : 'es'}
       · ${line.pattern.stops.length} stops · tap to
       ${expanded ? 'collapse' : 'expand'}</span>`;
@@ -1473,7 +1545,7 @@ function buildStopMiniStrip(savedSid, line, lineRuns, stops, now) {
   // Where the chosen bus is right now (its next-stop index on this pattern).
   let busIdx = -1;
   if (bestRun) {
-    busIdx = bestRun.nextStopId ? stops.indexOf(bestRun.nextStopId) : -1;
+    busIdx = stopIndexForRun(bestRun, stops, line);
     if (busIdx < 0 && bestRun.vehicle && bestRun.vehicle.lat != null)
       busIdx = nearestStopIndex(stops, bestRun.vehicle.lat, bestRun.vehicle.lon);
   }
@@ -1550,7 +1622,7 @@ function buildMiniChain(busIdx, savedIdx) {
 
 function buildBusStrip(run, line, now) {
   const stops = line.pattern.stops;
-  let nextIdx = run.nextStopId ? stops.indexOf(run.nextStopId) : -1;
+  let nextIdx = stopIndexForRun(run, stops, line);
   if (nextIdx < 0 && run.vehicle && run.vehicle.lat != null)
     nextIdx = nearestStopIndex(stops, run.vehicle.lat, run.vehicle.lon);
 
@@ -1630,7 +1702,7 @@ function buildFullBody(line, lineRuns, now) {
   });
 
   for (const run of lineRuns) {
-    const marker = buildBusMarker(run, stops, now, H);
+    const marker = buildBusMarker(run, stops, now, H, line);
     if (marker) body.appendChild(marker);
   }
   if (lineRuns.length === 0) {
@@ -1642,8 +1714,8 @@ function buildFullBody(line, lineRuns, now) {
   return body;
 }
 
-function buildBusMarker(run, stops, now, H) {
-  const pos = computeRailPosition(run, stops, now);
+function buildBusMarker(run, stops, now, H, line) {
+  const pos = computeRailPosition(run, stops, now, line);
   if (pos == null) return null;
   const top = Math.max(0, pos) * H + H / 2;
   const eta = run.nextStopId ? run.etas.get(run.nextStopId) : null;
@@ -1869,16 +1941,26 @@ function renderLinePicker() {
 
   for (const line of shown) {
     const lbl = document.createElement('label');
-    lbl.className = 'line-opt';
+    lbl.className = 'line-opt' + (line.isLoop ? ' line-opt-loop' : '');
+    const prefix = line.isLoop ? '↔' : '→';
     lbl.innerHTML = `
       <input type="checkbox" ${selected.has(line.key) ? 'checked' : ''}>
       <span class="route-badge" style="background:${line.color};color:${line.text}">
         ${esc(line.short)}</span>
-      <span class="ln-name">→ ${esc(line.headsign)}</span>`;
+      <span class="ln-name">${prefix} ${esc(line.headsign)}</span>
+      ${line.isLoop ? '<span class="ln-tag">loop view</span>' : ''}`;
     lbl.querySelector('input').onchange = async (e) => {
       if (e.target.checked) {
         if (!prefs.lines.includes(line.key)) prefs.lines.push(line.key);
         if (!prefs.compact) expandedCards.add(line.key);
+        // Mutual exclusion between "<route>:loop" and the two directions —
+        // having both on screen would render the same route twice.
+        if (line.isLoop) {
+          prefs.lines = prefs.lines.filter(k =>
+            k !== line.routeId + ':0' && k !== line.routeId + ':1');
+        } else {
+          prefs.lines = prefs.lines.filter(k => k !== line.routeId + ':loop');
+        }
         savePrefs();
         renderLinePicker();
         renderTimelines();                  // shows a "loading…" card meanwhile

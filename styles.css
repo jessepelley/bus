@@ -201,7 +201,15 @@ button.pill { font-family: inherit; }
 }
 .line-opt:hover { border-color: var(--accent); }
 .line-opt input { accent-color: var(--accent); width: 17px; height: 17px; }
-.line-opt .ln-name { font-weight: 600; font-size: .9rem; }
+.line-opt .ln-name { font-weight: 600; font-size: .9rem;
+                     flex: 1 1 auto; min-width: 0;
+                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.line-opt-loop { background: var(--bg-3); }
+.ln-tag {
+  font-size: .65rem; text-transform: uppercase; letter-spacing: .05em;
+  background: var(--accent); color: #fff;
+  padding: .12rem .4rem; border-radius: 999px; flex: 0 0 auto;
+}
 
 .route-badge {
   display: inline-flex; align-items: center; justify-content: center;
