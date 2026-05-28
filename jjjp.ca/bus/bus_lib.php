@@ -34,6 +34,11 @@ define('SCHED_DIR',       __DIR__ . '/schedule');             // per-route sched
 
 // History retention for the samples table.
 define('SAMPLE_RETENTION_DAYS', 90);
+// Retention for the upstream-fetch log + daily visits (small tables, just trim).
+define('FETCH_LOG_RETENTION_DAYS', 14);
+define('VISITS_RETENTION_DAYS', 365);
+// Salt used to hash IPs into per-day visitor ids. Rotate to invalidate history.
+define('VISITS_SALT', 'busjjjp-v1');
 
 define('BUS_DEBUG', false);
 
@@ -78,10 +83,64 @@ function bus_http_get($url, array $headers)
 }
 
 /**
+ * HTTP GET with detailed status — returns body + http code + curl/transport error.
+ * Same semantics as bus_http_get() but always reports the failure reason so the
+ * diagnostics endpoint can show *why* an upstream fetch did not return a body.
+ */
+function bus_http_get_detail($url, array $headers)
+{
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_TIMEOUT        => UPSTREAM_TIMEOUT,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_SSL_VERIFYPEER => true,
+        ]);
+        $body = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = $body === false ? curl_error($ch) : '';
+        $total = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
+        curl_close($ch);
+        return [
+            'body' => ($body !== false && $code >= 200 && $code < 300) ? $body : null,
+            'code' => $code,
+            'err'  => $err ?: ($body === false ? 'transport failure' :
+                              ($code >= 400 ? 'HTTP ' . $code : '')),
+            'ms'   => (int) round(($total ?: 0) * 1000),
+        ];
+    }
+    $ctx = stream_context_create(['http' => [
+        'method' => 'GET', 'header' => implode("\r\n", $headers),
+        'timeout' => UPSTREAM_TIMEOUT, 'ignore_errors' => true,
+    ]]);
+    $t0 = microtime(true);
+    $body = @file_get_contents($url, false, $ctx);
+    $ms = (int) round((microtime(true) - $t0) * 1000);
+    $code = 0;
+    if (isset($http_response_header[0]) &&
+        preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) {
+        $code = (int) $m[1];
+    }
+    return [
+        'body' => ($body !== false && $code >= 200 && $code < 300) ? $body : null,
+        'code' => $code,
+        'err'  => $body === false ? 'transport failure'
+                 : ($code >= 400 ? 'HTTP ' . $code : ''),
+        'ms'   => $ms,
+    ];
+}
+
+/**
  * Fetch one GTFS-RT feed as a decoded array, with a shared on-disk cache.
  *   $maxAge — serve the cache if it is younger than this many seconds.
  *             api.php passes CACHE_TTL so a burst of visitors shares one fetch.
- * Returns ['data'=>array|null, 'age'=>int, 'stale'=>bool].
+ * Returns ['data'=>array|null, 'age'=>int, 'stale'=>bool, 'source'=>'cache|fresh|stale_fallback|missing',
+ *          'http'=>int, 'err'=>string, 'ms'=>int].
+ *
+ * Logs every upstream attempt (success or failure) into the fetch_log table so
+ * the diagnostics endpoint can surface "why is data delayed right now".
  */
 function bus_fetch_feed($path, $maxAge)
 {
@@ -92,26 +151,89 @@ function bus_fetch_feed($path, $maxAge)
         $age = time() - filemtime($cacheFile);
         if ($age < $maxAge) {
             return ['data' => json_decode(file_get_contents($cacheFile), true),
-                    'age' => $age, 'stale' => false];
+                    'age' => $age, 'stale' => false, 'source' => 'cache',
+                    'http' => 0, 'err' => '', 'ms' => 0];
         }
     }
 
-    $raw = bus_http_get(OCT_BASE . '/' . $path . '?format=json',
-                        ['Ocp-Apim-Subscription-Key: ' . OCT_KEY]);
-    if ($raw !== null) {
-        $data = json_decode($raw, true);
+    $res = bus_http_get_detail(OCT_BASE . '/' . $path . '?format=json',
+                               ['Ocp-Apim-Subscription-Key: ' . OCT_KEY]);
+    if ($res['body'] !== null) {
+        $data = json_decode($res['body'], true);
         if (is_array($data)) {
-            file_put_contents($cacheFile, $raw, LOCK_EX);
-            return ['data' => $data, 'age' => 0, 'stale' => false];
+            file_put_contents($cacheFile, $res['body'], LOCK_EX);
+            bus_log_fetch($path, $res['code'] ?: 200, $res['ms'], '');
+            return ['data' => $data, 'age' => 0, 'stale' => false,
+                    'source' => 'fresh', 'http' => $res['code'] ?: 200,
+                    'err' => '', 'ms' => $res['ms']];
         }
+        // Body came back but did not parse — treat as a failure.
+        $res['err'] = $res['err'] ?: 'json parse failed';
     }
+
+    bus_log_fetch($path, $res['code'], $res['ms'], $res['err'] ?: 'no body');
 
     // Upstream failed — fall back to stale cache if we have any.
     if (is_file($cacheFile)) {
         return ['data' => json_decode(file_get_contents($cacheFile), true),
-                'age' => time() - filemtime($cacheFile), 'stale' => true];
+                'age' => time() - filemtime($cacheFile), 'stale' => true,
+                'source' => 'stale_fallback', 'http' => $res['code'],
+                'err' => $res['err'], 'ms' => $res['ms']];
     }
-    return ['data' => null, 'age' => -1, 'stale' => true];
+    return ['data' => null, 'age' => -1, 'stale' => true,
+            'source' => 'missing', 'http' => $res['code'],
+            'err' => $res['err'], 'ms' => $res['ms']];
+}
+
+/** Append one fetch attempt to the log. Best-effort — never throws. */
+function bus_log_fetch($path, $httpCode, $ms, $err)
+{
+    try {
+        $db = bus_open_db();
+        $stmt = $db->prepare(
+            'INSERT INTO fetch_log (at, path, http_code, ms, err)
+             VALUES (:a, :p, :c, :m, :e)');
+        $stmt->bindValue(':a', time(),     SQLITE3_INTEGER);
+        $stmt->bindValue(':p', $path,      SQLITE3_TEXT);
+        $stmt->bindValue(':c', (int)$httpCode, SQLITE3_INTEGER);
+        $stmt->bindValue(':m', (int)$ms,   SQLITE3_INTEGER);
+        $stmt->bindValue(':e', (string)$err, SQLITE3_TEXT);
+        $stmt->execute();
+        $db->close();
+    } catch (Exception $e) { /* best-effort */ }
+}
+
+/**
+ * Record one anonymised visitor for today. The IP is hashed with the date and
+ * a private salt so the same visitor counts once per day but raw IPs are never
+ * stored. UNIQUE(day, hash) collapses repeat hits into a single row.
+ */
+function bus_record_visit()
+{
+    try {
+        $ip = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? '';
+        if ($ip === '') return;
+        $ip = trim(explode(',', $ip)[0]);
+        $tz = new DateTimeZone('America/Toronto');
+        $day = (new DateTime('now', $tz))->format('Y-m-d');
+        $hash = substr(hash('sha256', VISITS_SALT . '|' . $day . '|' . $ip), 0, 16);
+        $db = bus_open_db();
+        $stmt = $db->prepare(
+            'INSERT OR IGNORE INTO daily_visits (day, hash, first_at, hits)
+             VALUES (:d, :h, :t, 1)');
+        $stmt->bindValue(':d', $day, SQLITE3_TEXT);
+        $stmt->bindValue(':h', $hash, SQLITE3_TEXT);
+        $stmt->bindValue(':t', time(), SQLITE3_INTEGER);
+        $stmt->execute();
+        // Bump hits even if the row already existed — useful to spot real activity.
+        $bump = $db->prepare(
+            'UPDATE daily_visits SET hits = hits + 1
+             WHERE day = :d AND hash = :h');
+        $bump->bindValue(':d', $day, SQLITE3_TEXT);
+        $bump->bindValue(':h', $hash, SQLITE3_TEXT);
+        $bump->execute();
+        $db->close();
+    } catch (Exception $e) { /* best-effort */ }
 }
 
 /** Open (and, on first use, create) the reliability database. */
@@ -145,6 +267,28 @@ function bus_open_db()
             n_trips  INTEGER,
             n_veh    INTEGER,
             ok       INTEGER
+        )'
+    );
+    // Every upstream fetch attempt — for the diagnostics modal.
+    $db->exec(
+        'CREATE TABLE IF NOT EXISTS fetch_log (
+            at        INTEGER NOT NULL,
+            path      TEXT    NOT NULL,
+            http_code INTEGER,
+            ms        INTEGER,
+            err       TEXT
+        )'
+    );
+    $db->exec('CREATE INDEX IF NOT EXISTS ix_fetch_log_at ON fetch_log (at)');
+    // Anonymised daily visitor counts (hash(salt|day|ip), so same visitor
+    // counts once/day but the raw IP is never stored).
+    $db->exec(
+        'CREATE TABLE IF NOT EXISTS daily_visits (
+            day       TEXT    NOT NULL,
+            hash      TEXT    NOT NULL,
+            first_at  INTEGER,
+            hits      INTEGER DEFAULT 1,
+            PRIMARY KEY (day, hash)
         )'
     );
     return $db;
@@ -238,6 +382,9 @@ function bus_record_samples($tuData, $vpData, $routeSet)
             $cutoff = (new DateTime('-' . SAMPLE_RETENTION_DAYS . ' days', $tz))->format('Ymd');
             $db->exec("DELETE FROM samples WHERE sdate < '" . SQLite3::escapeString($cutoff) . "'");
             $db->exec('DELETE FROM collector_runs WHERE ran_at < ' . ($now - 14 * 86400));
+            $db->exec('DELETE FROM fetch_log WHERE at < ' . ($now - FETCH_LOG_RETENTION_DAYS * 86400));
+            $visCutoff = (new DateTime('-' . VISITS_RETENTION_DAYS . ' days', $tz))->format('Y-m-d');
+            $db->exec("DELETE FROM daily_visits WHERE day < '" . SQLite3::escapeString($visCutoff) . "'");
         }
         $db->close();
     } catch (Exception $e) {

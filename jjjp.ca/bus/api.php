@@ -52,6 +52,7 @@ switch ($action) {
     case 'whoami':   echo json_encode(['ok' => true, 'authenticated' => false]); break;
     case 'realtime': handleRealtime(); break;
     case 'stats':    handleStats(); break;
+    case 'diag':     handleDiag(); break;
     default:
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'Unknown action']);
@@ -69,11 +70,25 @@ function handleRealtime()
     $vp = bus_fetch_feed(VP_PATH, CACHE_TTL);
     $tu = bus_fetch_feed(TU_PATH, CACHE_TTL);
 
+    // Record this caller as a visitor (anonymous, daily-bucketed). Cheap;
+    // safe to run even when filter is null.
+    bus_record_visit();
+
     $out = [
         'ok' => true, 'fetched' => time(),
         'stale' => ($vp['stale'] || $tu['stale']),
         'vp_age' => $vp['age'], 'tu_age' => $tu['age'],
         'vp_ts' => null, 'tu_ts' => null,
+        // Surface the per-feed source + any upstream error so the client's
+        // diagnostics panel can explain a stale view without a second round-trip.
+        'feeds' => [
+            'vp' => ['source' => $vp['source'], 'age' => $vp['age'],
+                     'http'   => $vp['http'],   'err' => $vp['err'],
+                     'ms'     => $vp['ms']],
+            'tu' => ['source' => $tu['source'], 'age' => $tu['age'],
+                     'http'   => $tu['http'],   'err' => $tu['err'],
+                     'ms'     => $tu['ms']],
+        ],
         'vehicles' => [], 'trips' => [],
     ];
 
@@ -292,6 +307,118 @@ function handleStats()
     $json = json_encode($out);
     @file_put_contents($cacheFile, $json, LOCK_EX);
     echo $json;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+/**
+ * Diagnostics — surfaced to the client so the user can troubleshoot a stale
+ * view without SSH. Reports on cache state, recent upstream attempts, sample
+ * DB size, and anonymous visitor counts (daily / 7-day).
+ */
+function handleDiag()
+{
+    $now = time();
+    $vpFile = CACHE_DIR . '/' . md5(VP_PATH) . '.json';
+    $tuFile = CACHE_DIR . '/' . md5(TU_PATH) . '.json';
+    $cacheState = function ($file) {
+        if (!is_file($file)) return ['present' => false];
+        return ['present' => true,
+                'age'     => time() - filemtime($file),
+                'bytes'   => filesize($file)];
+    };
+
+    $out = [
+        'ok'         => true,
+        'time'       => $now,
+        'cache_ttl'  => CACHE_TTL,
+        'timeout'    => UPSTREAM_TIMEOUT,
+        'cache'      => [
+            'vp' => $cacheState($vpFile),
+            'tu' => $cacheState($tuFile),
+        ],
+    ];
+
+    // Recent upstream fetches (success and failure both — useful context).
+    $recent = []; $errors = []; $byPath = [];
+    if (is_file(DB_PATH)) {
+        try {
+            $db = bus_open_db();
+
+            $r = $db->query('SELECT at, path, http_code, ms, err FROM fetch_log
+                             ORDER BY at DESC LIMIT 30');
+            while ($row = $r->fetchArray(SQLITE3_ASSOC)) {
+                $recent[] = $row;
+                if ($row['err'] !== '' && count($errors) < 6) $errors[] = $row;
+            }
+
+            // Per-path: success/fail counts for the last 1h.
+            $cutoff = $now - 3600;
+            $s = $db->query("SELECT path,
+                                    SUM(CASE WHEN err = '' THEN 1 ELSE 0 END) AS ok,
+                                    SUM(CASE WHEN err <> '' THEN 1 ELSE 0 END) AS fail,
+                                    MAX(at) AS last_at,
+                                    MAX(CASE WHEN err = '' THEN at END) AS last_ok_at,
+                                    MAX(CASE WHEN err <> '' THEN at END) AS last_fail_at
+                             FROM fetch_log WHERE at >= $cutoff GROUP BY path");
+            while ($row = $s->fetchArray(SQLITE3_ASSOC)) $byPath[] = $row;
+
+            // Sample / heartbeat / visitor counts.
+            $tz = new DateTimeZone('America/Toronto');
+            $today = (new DateTime('now', $tz))->format('Y-m-d');
+            $weekAgo = (new DateTime('-6 days', $tz))->format('Y-m-d');
+
+            $out['samples'] = [
+                'total' => (int) $db->querySingle('SELECT COUNT(*) FROM samples'),
+                'today' => (int) $db->querySingle(
+                    "SELECT COUNT(*) FROM samples WHERE sdate = '" .
+                    str_replace('-', '', $today) . "'"),
+                'last_at' => (int) $db->querySingle('SELECT MAX(last_at) FROM samples'),
+            ];
+
+            $heartbeatLast = (int) $db->querySingle('SELECT MAX(ran_at) FROM collector_runs');
+            $out['heartbeat'] = [
+                'last_at' => $heartbeatLast,
+                'age'     => $heartbeatLast ? $now - $heartbeatLast : null,
+                'minutes_24h' => (int) $db->querySingle(
+                    'SELECT COUNT(*) FROM collector_runs WHERE ran_at > ' . ($now - 86400)),
+            ];
+
+            // Visitors — today, yesterday, last 7 days, plus a tiny per-day series.
+            $vToday = (int) $db->querySingle(
+                "SELECT COUNT(*) FROM daily_visits WHERE day = '" .
+                SQLite3::escapeString($today) . "'");
+            $hitsToday = (int) $db->querySingle(
+                "SELECT COALESCE(SUM(hits),0) FROM daily_visits WHERE day = '" .
+                SQLite3::escapeString($today) . "'");
+            $vWeek = (int) $db->querySingle(
+                "SELECT COUNT(*) FROM daily_visits WHERE day >= '" .
+                SQLite3::escapeString($weekAgo) . "'");
+            $series = [];
+            $sq = $db->query("SELECT day, COUNT(*) AS v, SUM(hits) AS h
+                              FROM daily_visits
+                              WHERE day >= '" . SQLite3::escapeString($weekAgo) . "'
+                              GROUP BY day ORDER BY day");
+            while ($row = $sq->fetchArray(SQLITE3_ASSOC)) $series[] = $row;
+            $out['visitors'] = [
+                'today'       => $vToday,
+                'hits_today'  => $hitsToday,
+                'week'        => $vWeek,
+                'series'      => $series,
+            ];
+
+            $db->close();
+        } catch (Exception $e) {
+            $out['db_error'] = BUS_DEBUG ? $e->getMessage() : 'db error';
+        }
+    } else {
+        $out['db_error'] = 'database not present yet';
+    }
+
+    $out['recent_fetches'] = $recent;
+    $out['recent_errors']  = $errors;
+    $out['fetch_summary']  = $byPath;
+
+    echo json_encode($out);
 }
 
 /** Add derived percentages/averages to a counts array. */

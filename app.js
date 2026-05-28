@@ -18,6 +18,11 @@ const STOPS_URL = 'data/stops.json';
 const ROUTE_URL = (file) => `data/routes/${file}.json`;
 const PREFS_KEY = 'busjjjp.prefs';
 const STALE_VEHICLE = 150;                  // s — a bus older than this is "faded"
+const TABS = ['now', 'routes', 'map', 'more'];
+// Ghost-trail prediction: don't extrapolate further than this past the last GPS.
+const GHOST_MAX_AGE = 240;                  // s — beyond this the bus is "lost"
+const GHOST_TRAIL_LEN = 8;                  // recent predicted positions to keep
+const RAIL_TICK_MS = 200;                   // smooth-animation cadence
 
 const TILES = {
   light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
@@ -38,12 +43,19 @@ let lastData    = null;
 let lastPollClient = 0;
 let pollTimer   = null;
 let renderTimer = null;
+let railTimer   = null;
 let statsTimer  = null;
 let statsByRoute = {};                      // routeId -> reliability stats
 let map = null, mapLayers = null, tileLayer = null;
 let nearbyMap = null, nearbyMapLayers = null, nearbyTiles = null;
 let lastNearbyResults = null;               // { me:{lat,lon}, items:[{sid,s,d}] }
 const expandedCards = new Set();            // line keys shown as full timelines
+let activeTab = 'now';                      // current main pane
+// Ghost-trail state: shapeIndex memoises cumulative-distance tables per shape
+// id; vehicleHistory keeps a small ring of recent {lat,lon,t} per vehicle id
+// so we can render a fading trail without persisting it server-side.
+const shapeIndex    = new Map();            // shapeId -> { pts, cum, total }
+const vehicleHistory = new Map();           // vehId -> [{lat, lon, t, predicted}]
 
 const prefs = {
   lines:    ['45:1', '5:0'],
@@ -56,6 +68,8 @@ const prefs = {
   theme:    'light',
   compact:  true,
   expanded: [],
+  tab:      'now',
+  ghost:    true,                           // calculus-based predicted-position overlay
 };
 
 /* ── Boot ───────────────────────────────────────────────────────────────── */
@@ -101,7 +115,8 @@ async function init() {
 
   renderLinePicker();
   renderFavStops();
-  if (prefs.showMap) { document.getElementById('map-toggle').checked = true; enableMap(); }
+  if (prefs.showMap) { document.getElementById('map-toggle').checked = true; }
+  activateTab(TABS.includes(prefs.tab) ? prefs.tab : 'now');
 
   await poll();
   startTimers();
@@ -234,6 +249,8 @@ function loadPrefs() {
   document.getElementById('refresh-select').value = String(prefs.refresh);
   document.getElementById('theme-select').value = prefs.theme;
   document.getElementById('compact-toggle').checked = prefs.compact;
+  const ghToggle = document.getElementById('ghost-toggle');
+  if (ghToggle) ghToggle.checked = prefs.ghost !== false;
   const nmToggle = document.getElementById('nearby-map-toggle');
   if (nmToggle) nmToggle.checked = !!prefs.nearbyOnMap;
 }
@@ -354,10 +371,15 @@ function wireChrome() {
     savePrefs(); renderTimelines();
   };
 
+  const ghToggle = document.getElementById('ghost-toggle');
+  if (ghToggle) ghToggle.onchange = (e) => {
+    prefs.ghost = e.target.checked; savePrefs();
+    renderAll();
+  };
+
   document.getElementById('map-toggle').onchange = (e) => {
     prefs.showMap = e.target.checked; savePrefs();
-    if (prefs.showMap) enableMap();
-    else document.getElementById('map-wrap').classList.add('hidden');
+    if (prefs.showMap) activateTab('map');
   };
 
   document.getElementById('refresh-select').onchange = (e) => {
@@ -365,6 +387,22 @@ function wireChrome() {
   };
 
   document.getElementById('nearby-btn').onclick = findNearby;
+
+  // Bottom tab bar — primary nav on mobile, also works on desktop.
+  document.querySelectorAll('#tabbar .tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => activateTab(btn.dataset.tab));
+  });
+
+  // Freshness pill → diagnostics modal.
+  document.getElementById('freshness').addEventListener('click', openDiag);
+  document.getElementById('diag-close').addEventListener('click', closeDiag);
+  document.getElementById('diag-refresh').addEventListener('click', refreshDiag);
+  document.getElementById('diag-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'diag-modal') closeDiag();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeDiag();
+  });
 
   const nmToggle = document.getElementById('nearby-map-toggle');
   if (nmToggle) nmToggle.onchange = (e) => {
@@ -386,14 +424,376 @@ function setSidebar(open) {
 }
 
 function onResize() {
-  if (window.innerWidth > 760) setSidebar(true);
+  // Crossing the mobile breakpoint: re-park the sidebar back into the layout
+  // (it might be hosted in the "More" tab from a previous mobile session).
+  const sidebar = document.getElementById('sidebar');
+  const moreHost = document.getElementById('more-host');
+  if (window.innerWidth > 760) {
+    if (sidebar.parentElement === moreHost) {
+      document.getElementById('layout').insertBefore(
+        sidebar, document.getElementById('content'));
+      // The "more" pane is mobile-only — fall back to "now" on the bigger screen.
+      if (activeTab === 'more') activateTab('now');
+    }
+    setSidebar(true);
+  }
+}
+
+/* ── Tabs ───────────────────────────────────────────────────────────────── */
+function activateTab(tab) {
+  if (!TABS.includes(tab)) tab = 'now';
+  activeTab = tab;
+  prefs.tab = tab;
+  document.body.dataset.tab = tab;
+  document.querySelectorAll('.tab-pane').forEach(p => {
+    p.hidden = p.dataset.tab !== tab;
+  });
+  document.querySelectorAll('#tabbar .tab-btn').forEach(b => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-current', on ? 'page' : 'false');
+  });
+  // "More" tab is mobile-only — move the sidebar in/out of it as needed.
+  // On desktop the sidebar stays where it is in #layout.
+  const mobile = window.innerWidth <= 760;
+  const sidebar = document.getElementById('sidebar');
+  const moreHost = document.getElementById('more-host');
+  if (mobile && tab === 'more') {
+    if (sidebar.parentElement !== moreHost) moreHost.appendChild(sidebar);
+  } else if (sidebar.parentElement === moreHost) {
+    document.getElementById('layout').insertBefore(
+      sidebar, document.getElementById('content'));
+  }
+
+  if (tab === 'map') enableMap();
+  savePrefs();
+  renderAll();
+}
+
+/* ── Diagnostics modal ─────────────────────────────────────────────────── */
+let lastDiag = null;
+function openDiag() {
+  document.getElementById('diag-modal').classList.remove('hidden');
+  refreshDiag();
+}
+function closeDiag() {
+  document.getElementById('diag-modal').classList.add('hidden');
+}
+async function refreshDiag() {
+  const body = document.getElementById('diag-body');
+  body.innerHTML = '<div class="empty-mini">Loading…</div>';
+  try {
+    const headers = {};
+    if (auth.isAuthenticated()) headers['X-API-Key'] = auth.getToken();
+    const res = await fetch(`${API_URL}?action=diag`, { headers });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    lastDiag = await res.json();
+  } catch (e) {
+    body.innerHTML = `<div class="diag-bad">Could not reach the proxy:
+      ${esc(e.message)}.</div>`;
+    return;
+  }
+  body.innerHTML = renderDiag(lastDiag);
+}
+
+function renderDiag(d) {
+  if (!d || !d.ok) return `<div class="diag-bad">Proxy returned an error.</div>`;
+  const ago = (t) => t ? fmtAgo((Date.now() / 1000) - t) : '—';
+  const verdict = diagnose(d);
+
+  const cacheRow = (name, c) => c.present
+    ? `<tr><th>${name} cache</th><td>${fmtAgo(c.age)} old · ${fmtBytes(c.bytes)}</td></tr>`
+    : `<tr><th>${name} cache</th><td class="bad">missing</td></tr>`;
+
+  const feedNow = lastData && lastData.feeds ? lastData.feeds : null;
+  const feedRow = (name, f) => !f ? '' :
+    `<tr><th>${name} this poll</th><td>
+      <code>${esc(f.source)}</code>
+      ${f.err ? ` · <span class="bad">${esc(f.err)}</span>` : ''}
+      ${f.http ? ' · HTTP ' + f.http : ''}
+      ${f.ms ? ' · ' + f.ms + ' ms' : ''}
+      ${f.age != null && f.age >= 0 ? ' · ' + fmtAgo(f.age) + ' old' : ''}
+    </td></tr>`;
+
+  const errors = (d.recent_errors || []).slice(0, 5).map(e =>
+    `<li><code>${esc(e.path.split('/').slice(-2).join('/'))}</code>
+      · HTTP ${e.http_code || '—'} · ${esc(e.err || 'unknown')}
+      · ${ago(e.at)}</li>`).join('');
+
+  const sum = (d.fetch_summary || []).map(p =>
+    `<li><code>${esc(p.path.split('/').slice(-2).join('/'))}</code>:
+      <span class="ok">${p.ok || 0} ok</span>
+      ${p.fail > 0 ? ` · <span class="bad">${p.fail} fail</span>` : ''}
+      · last ok ${ago(p.last_ok_at)}</li>`).join('');
+
+  const series = (d.visitors && d.visitors.series) || [];
+  const sparkline = series.length ? `<div class="diag-spark">${
+    series.map(s => `<span class="spark-bar" style="height:${
+      Math.min(100, (s.v || 0) * 18)}%"
+      title="${esc(s.day)}: ${s.v} visitors · ${s.h || 0} hits"></span>`).join('')
+    }</div>` : '';
+
+  return `
+    <div class="diag-verdict ${verdict.cls}">
+      <strong>${esc(verdict.title)}</strong>
+      <div>${esc(verdict.body)}</div>
+    </div>
+
+    <h4>This poll</h4>
+    <table class="diag-table">
+      ${feedRow('Vehicles', feedNow && feedNow.vp)}
+      ${feedRow('Trips',    feedNow && feedNow.tu)}
+      <tr><th>Server clock</th><td>${esc(new Date(d.time * 1000).toLocaleString())}</td></tr>
+      <tr><th>Cache TTL</th><td>${d.cache_ttl}s · upstream timeout ${d.timeout}s</td></tr>
+    </table>
+
+    <h4>Proxy state</h4>
+    <table class="diag-table">
+      ${cacheRow('Vehicles', d.cache.vp)}
+      ${cacheRow('Trips',    d.cache.tu)}
+      ${d.samples ? `<tr><th>Samples today</th><td>${d.samples.today.toLocaleString()}
+        of ${d.samples.total.toLocaleString()} · last write ${ago(d.samples.last_at)}</td></tr>` : ''}
+      ${d.heartbeat ? `<tr><th>Heartbeat</th><td>${
+        d.heartbeat.last_at ? 'last ' + ago(d.heartbeat.last_at) : '—'
+      } · ${d.heartbeat.minutes_24h} minutes active in 24h</td></tr>` : ''}
+    </table>
+
+    ${sum ? `<h4>Last hour</h4><ul class="diag-list">${sum}</ul>` : ''}
+    ${errors ? `<h4>Recent errors</h4><ul class="diag-list">${errors}</ul>` : ''}
+
+    ${d.visitors ? `
+      <h4>Visitors</h4>
+      <table class="diag-table">
+        <tr><th>Today</th><td>${d.visitors.today} unique · ${d.visitors.hits_today} hits</td></tr>
+        <tr><th>Last 7 days</th><td>${d.visitors.week} unique</td></tr>
+      </table>
+      ${sparkline}
+      <p class="diag-note">Anonymous: only a salted daily hash of the IP is stored.</p>
+    ` : ''}
+
+    <p class="diag-note">Schedule built ${esc(GTFS.generated || '—')}.
+       Reliability data is gathered while the app is in use — not 24/7.</p>
+  `;
+}
+
+/* Decide a one-line "is data flowing?" verdict from a diag payload. */
+function diagnose(d) {
+  const feeds = lastData && lastData.feeds;
+  if (feeds) {
+    if (feeds.vp.source === 'missing' || feeds.tu.source === 'missing')
+      return { cls: 'bad', title: 'Upstream feed missing',
+        body: 'OC Transpo did not return a usable feed and the proxy has no cache to fall back to.' };
+    if (feeds.vp.source === 'stale_fallback' || feeds.tu.source === 'stale_fallback')
+      return { cls: 'bad',
+        title: 'Upstream failing — serving stale cache',
+        body: 'The last upstream attempt failed (' +
+          (feeds.vp.err || feeds.tu.err || 'unknown') +
+          '). The proxy is serving the last cached payload.' };
+  }
+  const recent = d.recent_fetches || [];
+  const failsInLastHour = (d.fetch_summary || []).reduce((n, p) => n + (p.fail || 0), 0);
+  const oksInLastHour = (d.fetch_summary || []).reduce((n, p) => n + (p.ok || 0), 0);
+  if (failsInLastHour > 0 && failsInLastHour >= oksInLastHour)
+    return { cls: 'warn',
+      title: 'Upstream unstable',
+      body: failsInLastHour + ' failed upstream fetch'
+        + (failsInLastHour === 1 ? '' : 'es')
+        + ' vs ' + oksInLastHour + ' ok in the last hour.' };
+  if (!lastData)
+    return { cls: 'warn', title: 'No realtime data yet',
+      body: 'The app hasn\'t completed its first poll. If this persists, the proxy may be unreachable.' };
+
+  const feedTs = Math.min(lastData.vp_ts || Infinity, lastData.tu_ts || Infinity);
+  const age = isFinite(feedTs) ? (serverNow() - feedTs) : null;
+  if (age != null && age > 180)
+    return { cls: 'warn', title: 'Feed timestamps are old',
+      body: 'OC Transpo\'s own header timestamp is ' + fmtAgo(age) +
+            '. The proxy is fetching, but the upstream feed itself is stale.' };
+  return { cls: 'ok', title: 'Data is flowing',
+    body: 'Upstream feeds reachable and recent. Proxy cache fresh.' };
+}
+
+/* ── Ghost-trail prediction — calculus along the route polyline ─────────── */
+/* For each route shape we precompute a cumulative-distance table; projecting
+   a GPS point onto the shape gives us a scalar offset s along the line. The
+   bus then advances by `speed * dt`. This is essentially numerical integration
+   of the bus's velocity along its known path. */
+function getShapeIndex(shapeId) {
+  if (!shapeId) return null;
+  let idx = shapeIndex.get(shapeId);
+  if (idx) return idx;
+  const pts = GTFS.shapes[shapeId];
+  if (!pts || pts.length < 2) return null;
+  const cum = [0];
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    total += haversine(pts[i-1][0], pts[i-1][1], pts[i][0], pts[i][1]);
+    cum.push(total);
+  }
+  idx = { pts, cum, total };
+  shapeIndex.set(shapeId, idx);
+  return idx;
+}
+
+/* Project (lat,lon) onto the polyline, returning the cumulative-distance
+   offset of the closest point. O(n) but n is small (≤ ~1000) and the result
+   is cached per render. */
+function projectOnShape(idx, lat, lon) {
+  let best = 0, bestD = Infinity;
+  const pts = idx.pts, cum = idx.cum;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [aLat, aLon] = pts[i], [bLat, bLon] = pts[i + 1];
+    // Equirectangular approximation — good enough at city scale.
+    const ax = aLon, ay = aLat;
+    const bx = bLon, by = bLat;
+    const px = lon,  py = lat;
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const qx = ax + t * dx, qy = ay + t * dy;
+    const d = haversine(py, px, qy, qx);
+    if (d < bestD) {
+      bestD = d;
+      const segLen = cum[i + 1] - cum[i];
+      best = cum[i] + t * segLen;
+    }
+  }
+  return { offset: best, deviation: bestD };
+}
+
+/* Walk forward along the polyline from offset `s` by `meters`, returning the
+   interpolated lat/lon. Clamps to the end. */
+function offsetToLatLon(idx, s) {
+  const cum = idx.cum, pts = idx.pts;
+  s = Math.max(0, Math.min(idx.total, s));
+  // Binary search for the segment.
+  let lo = 0, hi = cum.length - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] <= s) lo = mid; else hi = mid;
+  }
+  const segLen = cum[hi] - cum[lo];
+  const t = segLen > 0 ? (s - cum[lo]) / segLen : 0;
+  return [
+    pts[lo][0] + t * (pts[hi][0] - pts[lo][0]),
+    pts[lo][1] + t * (pts[hi][1] - pts[lo][1]),
+  ];
+}
+
+/* The headline calculation. Given a vehicle (with its run / line resolved),
+   compute where it should be *now* based on its last GPS plus elapsed time. */
+function predictVehiclePosition(run) {
+  const v = run && run.vehicle;
+  if (!v || v.lat == null || v.lon == null) return null;
+  const now = serverNow();
+  const ts = v.ts || run.feedTs || now;
+  const dt = Math.max(0, now - ts);
+  // Always carry the GPS through, even if no shape — the map needs it.
+  const out = { lat: v.lat, lon: v.lon, dt, gpsAge: dt, predicted: false,
+                lastFix: { lat: v.lat, lon: v.lon, ts } };
+  if (dt < 3) return out;                          // too fresh to bother
+  if (dt > GHOST_MAX_AGE) { out.lost = true; return out; }
+
+  // 1) Shape-based prediction (preferred).
+  if (run.line && run.line.pattern && run.line.pattern.shape) {
+    const idx = getShapeIndex(run.line.pattern.shape);
+    if (idx) {
+      const proj = projectOnShape(idx, v.lat, v.lon);
+      // If the GPS is wildly off the shape, fall back to dead reckoning.
+      if (proj.deviation < 250) {
+        const speed = (v.speed != null && v.speed > 0)
+          ? v.speed
+          : estimateSpeedFromHistory(run.vehId, v) || 8;   // 8 m/s ~ 29 km/h
+        const advanced = proj.offset + speed * dt;
+        const [lat, lon] = offsetToLatLon(idx, advanced);
+        out.lat = lat; out.lon = lon;
+        out.predicted = true;
+        out.method = 'shape';
+        out.predOffset = advanced;
+        out.shapeId = run.line.pattern.shape;
+        return out;
+      }
+    }
+  }
+
+  // 2) Dead reckoning by bearing + speed.
+  if (v.bearing != null && v.speed != null && v.speed > 0) {
+    const R = 6371000;
+    const br = v.bearing * Math.PI / 180;
+    const d = v.speed * dt / R;
+    const φ1 = v.lat * Math.PI / 180;
+    const λ1 = v.lon * Math.PI / 180;
+    const φ2 = Math.asin(Math.sin(φ1) * Math.cos(d) +
+                         Math.cos(φ1) * Math.sin(d) * Math.cos(br));
+    const λ2 = λ1 + Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(φ1),
+                               Math.cos(d) - Math.sin(φ1) * Math.sin(φ2));
+    out.lat = φ2 * 180 / Math.PI;
+    out.lon = λ2 * 180 / Math.PI;
+    out.predicted = true;
+    out.method = 'bearing';
+  }
+  return out;
+}
+
+/* Compute speed from the last two recorded positions when the feed omits it
+   (some vehicles only report position). Returns m/s or null. */
+function estimateSpeedFromHistory(vehId, v) {
+  const hist = vehicleHistory.get(vehId);
+  if (!hist || hist.length < 2) return null;
+  const a = hist[hist.length - 2], b = hist[hist.length - 1];
+  const dt = b.t - a.t;
+  if (dt < 5 || dt > 300) return null;
+  const d = haversine(a.lat, a.lon, b.lat, b.lon);
+  return d / dt;
+}
+
+/* Maintain a small ring buffer of recent positions per vehicle id so we can
+   render a fading trail. Called once per poll with the *actual* GPS fix. */
+function recordVehicleHistory() {
+  if (!lastData) return;
+  for (const v of lastData.vehicles || []) {
+    if (!v || v.lat == null || !v.id) continue;
+    let hist = vehicleHistory.get(v.id);
+    if (!hist) { hist = []; vehicleHistory.set(v.id, hist); }
+    const last = hist[hist.length - 1];
+    const ts = v.ts || (lastData.fetched);
+    if (last && last.t === ts) continue;                    // unchanged
+    if (last && haversine(last.lat, last.lon, v.lat, v.lon) < 8 &&
+        ts - last.t < 60) continue;                         // barely moved
+    hist.push({ lat: v.lat, lon: v.lon, t: ts, gps: true });
+    while (hist.length > GHOST_TRAIL_LEN) hist.shift();
+  }
+  // Drop entries for vehicles we haven't seen in a long time.
+  const seen = new Set((lastData.vehicles || []).map(v => v.id));
+  const now = serverNow();
+  for (const [id, hist] of vehicleHistory) {
+    const last = hist[hist.length - 1];
+    if (!seen.has(id) && last && now - last.t > 600) vehicleHistory.delete(id);
+  }
 }
 
 function startTimers() {
   clearInterval(pollTimer);
   clearInterval(renderTimer);
+  clearInterval(railTimer);
   if (prefs.refresh > 0) pollTimer = setInterval(poll, prefs.refresh * 1000);
   renderTimer = setInterval(renderAll, 15000);   // keep countdowns ticking
+  // Smooth ghost-trail animation: re-tick the prediction at RAIL_TICK_MS so the
+  // bus marker visibly moves between GPS updates instead of jumping. Only runs
+  // when the user has ghosts on and the page is visible (saves battery).
+  railTimer = setInterval(tickGhostFrame, RAIL_TICK_MS);
+}
+
+/* Cheap inter-poll tick: just re-run the visible bus positions. Skips the
+   heavy work (departures board, timeline rebuild, stats) — only nudges the
+   rail bus markers and map ghosts forward along the route polyline. */
+function tickGhostFrame() {
+  if (document.hidden || prefs.ghost === false) return;
+  if (!lastData) return;
+  if (activeTab === 'routes') updateRailBusPositions();
+  if (activeTab === 'map' && map && mapLayers) renderMap();
+  if (activeTab === 'now')    updateNowGhosts();
 }
 
 /* px height of a timeline stop row — read from CSS so it stays in sync */
@@ -428,6 +828,7 @@ async function poll() {
     lastData = data;
     lastPollClient = Date.now();
     buildRuns();
+    recordVehicleHistory();
     renderAll();
   } catch (e) {
     console.error('poll failed', e);
@@ -507,10 +908,10 @@ function makeRun(tr, line, lineKey, etas, nextStopId, veh) {
 /* ════════════════════════════ Rendering ═══════════════════════════════ */
 function renderAll() {
   renderFreshness();
-  renderDeparturesBoard();
   renderFavStops();                          // refresh live-feed dots per poll
-  renderTimelines();
-  if (prefs.showMap && map) renderMap();
+  if (activeTab === 'now')    renderNow();
+  if (activeTab === 'routes') { renderDeparturesBoard(); renderTimelines(); }
+  if (activeTab === 'map' && map) renderMap();
 }
 
 /* ── Freshness pill + live indicator ────────────────────────────────────── */
@@ -566,6 +967,346 @@ function renderDeparturesBoard() {
       <div class="dep-rows">${rows}</div>`;
     board.appendChild(card);
   }
+}
+
+/* ── "Now" view ─────────────────────────────────────────────────────────── */
+/* The redesigned primary view, mobile-first. Surfaces what someone using this
+   for a real "do I need to leave?" check actually needs:
+     1. A status banner if the feed is unhealthy (links into diagnostics).
+     2. Big, glanceable arrival cards for the active stop group.
+     3. A predicted-position chain per saved-stop-on-line, with a ghost dot
+        for where the bus *should be right now* between GPS updates.
+     4. One-line route reliability strips. */
+function renderNow() {
+  renderNowAlert();
+  renderNowBoard();
+  renderNowStatus();
+  renderNowRoutes();
+}
+
+function renderNowAlert() {
+  const el = document.getElementById('now-alert');
+  if (!lastData) { el.classList.add('hidden'); return; }
+  const feedTs = Math.min(lastData.vp_ts || Infinity, lastData.tu_ts || Infinity);
+  const age = isFinite(feedTs) ? serverNow() - feedTs : null;
+  const feeds = lastData.feeds || {};
+  let title = null, body = null, kind = 'warn';
+
+  if ((feeds.vp && feeds.vp.source === 'missing') ||
+      (feeds.tu && feeds.tu.source === 'missing')) {
+    kind = 'bad';
+    title = 'Upstream feed unavailable.';
+    body = 'OC Transpo did not return a usable feed and the proxy has no cache to fall back to.';
+  } else if ((feeds.vp && feeds.vp.source === 'stale_fallback') ||
+             (feeds.tu && feeds.tu.source === 'stale_fallback')) {
+    kind = 'bad';
+    title = 'Upstream is failing — showing cached data.';
+    body = 'Last error: ' + ((feeds.vp && feeds.vp.err) ||
+                             (feeds.tu && feeds.tu.err) || 'unknown') + '.';
+  } else if (age != null && age > 180) {
+    kind = 'warn';
+    title = 'OC Transpo\'s feed itself is stale.';
+    body = 'The proxy is fetching cleanly, but the upstream header timestamp is '
+         + fmtAgo(age) + '.';
+  }
+
+  if (!title) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+  el.className = 'now-alert ' + kind;
+  el.classList.remove('hidden');
+  el.innerHTML = `
+    <div>
+      <strong>${esc(title)}</strong>
+      <div class="now-alert-body">${esc(body || '')}</div>
+    </div>
+    <button class="link-btn" id="now-alert-diag">Show details</button>`;
+  document.getElementById('now-alert-diag').onclick = openDiag;
+}
+
+function renderNowBoard() {
+  const host = document.getElementById('now-board');
+  host.innerHTML = '';
+  const now = serverNow();
+  const stops = activeGroup().stopIds;
+
+  if (stops.length === 0) {
+    host.innerHTML = `
+      <div class="now-empty">
+        <p>No saved stops in <strong>${esc(activeGroup().name)}</strong> yet.</p>
+        <p class="hint">Open <strong>Routes</strong>, expand a timeline, and tap ★
+          on a stop. Or use <strong>Find stops near me</strong> in the menu.</p>
+      </div>`;
+    return;
+  }
+
+  for (const sid of stops) {
+    const stop = GTFS.stops[sid];
+    if (!stop) continue;
+
+    const arrivals = [];
+    for (const run of runs) {
+      const t = run.etas.get(sid);
+      if (t && t > now - 30) arrivals.push({ run, t, mins: (t - now) / 60 });
+    }
+    arrivals.sort((a, b) => a.t - b.t);
+
+    const card = document.createElement('article');
+    card.className = 'now-card';
+    if (arrivals.length && arrivals[0].mins <= 6) card.classList.add('urgent');
+
+    const head = `
+      <header class="now-card-head">
+        <div class="now-stop">
+          <span class="now-stop-name">${esc(stop.name)}</span>
+          <span class="stop-code-tag">#${esc(stop.code)}</span>
+        </div>
+        <button class="link-btn now-card-remove" title="Remove from this group">✕</button>
+      </header>`;
+
+    let body;
+    if (arrivals.length === 0) {
+      body = `<div class="now-none">No live arrivals approaching.</div>`;
+    } else {
+      const first = arrivals[0];
+      const remaining = arrivals.slice(1, 4);
+      body = `
+        <div class="now-primary">
+          ${badge(first.run)}
+          <span class="now-headsign">${esc(first.run.headsign)}</span>
+          ${nowEta(first.t, now)}
+        </div>
+        ${ghostStripFor(first.run, sid, now)}
+        ${remaining.length ? `<div class="now-next">${
+          remaining.map(a => `<div class="now-next-row">
+            ${badge(a.run)}
+            <span class="now-headsign">${esc(a.run.headsign)}</span>
+            ${nowEta(a.t, now)}
+          </div>`).join('')
+        }</div>` : ''}`;
+    }
+
+    card.innerHTML = head + body;
+    card.querySelector('.now-card-remove').onclick = () => toggleFav(sid);
+    host.appendChild(card);
+  }
+}
+
+/* A horizontal predicted-position strip for the next bus reaching a saved
+   stop: the route polyline projected to a thin horizontal bar, with the bus's
+   predicted position marked as a moving ghost dot between stations. Re-renders
+   every poll; the dot itself is then nudged each tickGhostFrame. */
+function ghostStripFor(run, savedSid, now) {
+  if (prefs.ghost === false) return '';
+  if (!run.line || !run.line.pattern) return '';
+  const stops = run.line.pattern.stops;
+  const savedIdx = stops.indexOf(savedSid);
+  if (savedIdx < 0) return '';
+  const pred = predictVehiclePosition(run);
+  if (!pred) return '';
+  const idx = run.line.pattern.shape && getShapeIndex(run.line.pattern.shape);
+  if (!idx) return '';
+
+  // Find the polyline offset for each stop just for the visible window
+  // [savedIdx-3 .. savedIdx]. That keeps the strip readable.
+  const lo = Math.max(0, savedIdx - 4);
+  const hi = savedIdx;
+  const stopOffsets = [];
+  for (let i = lo; i <= hi; i++) {
+    const s = GTFS.stops[stops[i]];
+    if (!s) continue;
+    const o = projectOnShape(idx, s.lat, s.lon).offset;
+    stopOffsets.push({ idx: i, offset: o, name: s.name });
+  }
+  stopOffsets.sort((a, b) => a.offset - b.offset);
+  if (stopOffsets.length < 2) return '';
+
+  const o0 = stopOffsets[0].offset;
+  const o1 = stopOffsets[stopOffsets.length - 1].offset;
+  if (o1 <= o0) return '';
+
+  // Bus offset (predicted now and last GPS fix).
+  const busOffset = pred.predOffset != null ? pred.predOffset
+    : projectOnShape(idx, pred.lat, pred.lon).offset;
+  const fixOffset = pred.lastFix
+    ? projectOnShape(idx, pred.lastFix.lat, pred.lastFix.lon).offset
+    : busOffset;
+  const pct = (o) => Math.max(0, Math.min(100, 100 * (o - o0) / (o1 - o0)));
+
+  const stopMarkers = stopOffsets.map(s => `
+    <span class="gs-stop ${s.idx === savedIdx ? 'saved' : ''}"
+          style="left:${pct(s.offset).toFixed(1)}%"
+          title="${esc(s.name)}"></span>`).join('');
+
+  const fadeMs = pred.gpsAge > 60 ? 'pred-old' : '';
+  const trail = (vehicleHistory.get(run.vehId) || [])
+    .slice(-GHOST_TRAIL_LEN)
+    .map(p => {
+      const o = projectOnShape(idx, p.lat, p.lon).offset;
+      return `<span class="gs-trail" style="left:${pct(o).toFixed(1)}%"></span>`;
+    }).join('');
+
+  return `
+    <div class="ghost-strip" data-vid="${esc(run.vehId)}"
+         data-shape="${esc(run.line.pattern.shape)}"
+         data-o0="${o0}" data-o1="${o1}">
+      <div class="gs-rail"></div>
+      ${trail}
+      ${stopMarkers}
+      <span class="gs-fix" style="left:${pct(fixOffset).toFixed(1)}%"
+            title="Last GPS fix · ${fmtAgo(pred.gpsAge)} ago"></span>
+      <span class="gs-ghost ${fadeMs}" style="left:${pct(busOffset).toFixed(1)}%"
+            title="Predicted position now (${pred.method || 'gps'})">
+        <span class="gs-ghost-dot"></span>
+      </span>
+      ${pred.lost ? '<span class="gs-lost">tracking lost</span>' : ''}
+    </div>`;
+}
+
+function nowEta(t, now) {
+  const sec = t - now;
+  const cls = sec < 45 ? 'now' : (sec < 6 * 60 ? 'soon' : 'later');
+  return `<span class="now-eta ${cls}">
+    <span class="now-eta-big">${fmtEta(sec)}</span>
+    <small>${fmtClock(t)}</small></span>`;
+}
+
+function renderNowStatus() {
+  const el = document.getElementById('now-status');
+  if (!lastData) { el.innerHTML = ''; return; }
+  const feedTs = Math.min(lastData.vp_ts || Infinity, lastData.tu_ts || Infinity);
+  const age = isFinite(feedTs) ? serverNow() - feedTs : null;
+  const vp = lastData.feeds && lastData.feeds.vp;
+  const tu = lastData.feeds && lastData.feeds.tu;
+  const totBuses = (lastData.vehicles || []).length;
+  el.innerHTML = `
+    <div class="now-status-row">
+      <span>${totBuses} bus${totBuses === 1 ? '' : 'es'} tracking</span>
+      <span>·</span>
+      <span>${age != null ? 'feed ' + fmtAgo(age) : 'feed —'}</span>
+      ${vp ? `<span>·</span><span>VP <code>${esc(vp.source)}</code></span>` : ''}
+      ${tu ? `<span>·</span><span>TU <code>${esc(tu.source)}</code></span>` : ''}
+      <button class="link-btn" id="now-diag-link">details</button>
+    </div>`;
+  document.getElementById('now-diag-link').onclick = openDiag;
+}
+
+function renderNowRoutes() {
+  const host = document.getElementById('now-routes');
+  host.innerHTML = '';
+  if (prefs.lines.length === 0) {
+    host.innerHTML = `<div class="empty-mini">No routes selected — open the
+      menu and pick at least one line.</div>`;
+    return;
+  }
+  for (const key of prefs.lines) {
+    const line = LINES.get(key);
+    if (!line) continue;
+    const lineRuns = runs.filter(r => r.lineKey === key);
+    const stats = statsByRoute[line.routeId];
+    const today = stats && stats.available && stats.by_day && stats.by_day[0];
+    const otp = today && today.measured > 0 ? today.on_time_pct : null;
+
+    const row = document.createElement('div');
+    row.className = 'now-route';
+    row.innerHTML = `
+      ${badge({ short: line.short, color: line.color })}
+      <div class="now-route-title">→ ${esc(line.headsign)}</div>
+      <div class="now-route-meta">
+        ${lineRuns.length} bus${lineRuns.length === 1 ? '' : 'es'}
+        ${otp != null ? ` · ${otp}% on time` : ''}
+      </div>`;
+    row.onclick = () => { activateTab('routes'); };
+    host.appendChild(row);
+  }
+}
+
+/* Update only the ghost-dot positions inside ghost-strips, without rebuilding
+   the DOM. Called from tickGhostFrame at ~5Hz. */
+function updateNowGhosts() {
+  if (prefs.ghost === false) return;
+  const strips = document.querySelectorAll('#now-board .ghost-strip');
+  strips.forEach(strip => {
+    const vid = strip.dataset.vid;
+    const run = runs.find(r => r.vehId === vid);
+    if (!run) return;
+    const pred = predictVehiclePosition(run);
+    if (!pred) return;
+    const shapeId = strip.dataset.shape;
+    const idx = shapeIndex.get(shapeId);
+    if (!idx) return;
+    const o0 = +strip.dataset.o0, o1 = +strip.dataset.o1;
+    if (o1 <= o0) return;
+    const o = pred.predOffset != null ? pred.predOffset
+      : projectOnShape(idx, pred.lat, pred.lon).offset;
+    const pct = Math.max(0, Math.min(100, 100 * (o - o0) / (o1 - o0)));
+    const ghost = strip.querySelector('.gs-ghost');
+    if (ghost) ghost.style.left = pct.toFixed(1) + '%';
+  });
+}
+
+/* Same idea for the timeline rail: nudge the .bus-marker top offset between
+   stops without re-rendering the whole timeline card. */
+function updateRailBusPositions() {
+  if (prefs.ghost === false) return;
+  const H = rowH();
+  document.querySelectorAll('.timeline-body[data-line]').forEach(body => {
+    const lineKey = body.dataset.line;
+    const line = LINES.get(lineKey);
+    if (!line || !line.pattern) return;
+    const stops = line.pattern.stops;
+    const lineRuns = runs.filter(r => r.lineKey === lineKey);
+    const now = serverNow();
+    lineRuns.forEach(run => {
+      const marker = body.querySelector('.bus-marker[data-vid="' +
+        cssEscape(run.vehId) + '"]');
+      if (!marker) return;
+      const pos = computeRailPosition(run, stops, now);
+      if (pos == null) return;
+      marker.style.top = (pos * H + H / 2) + 'px';
+    });
+  });
+}
+
+/* Where on the rail (in fractional stop-row units) should this run draw? */
+function computeRailPosition(run, stops, now) {
+  let nextIdx = run.nextStopId ? stops.indexOf(run.nextStopId) : -1;
+  if (nextIdx < 0 && run.vehicle && run.vehicle.lat != null)
+    nextIdx = nearestStopIndex(stops, run.vehicle.lat, run.vehicle.lon);
+  if (nextIdx < 0) return null;
+  const prevIdx = Math.max(0, nextIdx - 1);
+
+  // If we have a shape + GPS, use the polyline projection (smooth across the
+  // segment). Otherwise fall back to the haversine ratio.
+  if (prefs.ghost !== false && run.line && run.line.pattern &&
+      run.line.pattern.shape && run.vehicle && run.vehicle.lat != null) {
+    const idx = getShapeIndex(run.line.pattern.shape);
+    const a = GTFS.stops[stops[prevIdx]], b = GTFS.stops[stops[nextIdx]];
+    if (idx && a && b) {
+      const pred = predictVehiclePosition(run);
+      const offset = pred && pred.predOffset != null ? pred.predOffset
+        : projectOnShape(idx, run.vehicle.lat, run.vehicle.lon).offset;
+      const oA = projectOnShape(idx, a.lat, a.lon).offset;
+      const oB = projectOnShape(idx, b.lat, b.lon).offset;
+      if (oB > oA) {
+        const t = Math.max(0, Math.min(1, (offset - oA) / (oB - oA)));
+        return prevIdx + t;
+      }
+    }
+  }
+  let frac = 0.55;
+  if (run.vehicle && run.vehicle.lat != null && nextIdx > 0) {
+    const a = GTFS.stops[stops[prevIdx]], b = GTFS.stops[stops[nextIdx]];
+    if (a && b) {
+      const dA = haversine(a.lat, a.lon, run.vehicle.lat, run.vehicle.lon);
+      const dB = haversine(b.lat, b.lon, run.vehicle.lat, run.vehicle.lon);
+      if (dA + dB > 0) frac = Math.min(0.95, Math.max(0.05, dA / (dA + dB)));
+    }
+  }
+  return prevIdx + frac;
+}
+
+function cssEscape(s) {
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, c =>
+    '\\' + c.charCodeAt(0).toString(16) + ' ');
 }
 
 /* ── Route timelines ────────────────────────────────────────────────────── */
@@ -857,6 +1598,7 @@ function buildFullBody(line, lineRuns, now) {
   const H = rowH();
   const body = document.createElement('div');
   body.className = 'timeline-body';
+  body.dataset.line = line.key;
   body.innerHTML = `<div class="rail"></div>`;
 
   stops.forEach((sid, i) => {
@@ -901,27 +1643,15 @@ function buildFullBody(line, lineRuns, now) {
 }
 
 function buildBusMarker(run, stops, now, H) {
-  let nextIdx = run.nextStopId ? stops.indexOf(run.nextStopId) : -1;
-  if (nextIdx < 0 && run.vehicle && run.vehicle.lat != null)
-    nextIdx = nearestStopIndex(stops, run.vehicle.lat, run.vehicle.lon);
-  if (nextIdx < 0) return null;
-
-  let frac = 0.55;
-  const prevIdx = Math.max(0, nextIdx - 1);
-  if (run.vehicle && run.vehicle.lat != null && nextIdx > 0) {
-    const a = GTFS.stops[stops[prevIdx]], b = GTFS.stops[stops[nextIdx]];
-    if (a && b) {
-      const dA = haversine(a.lat, a.lon, run.vehicle.lat, run.vehicle.lon);
-      const dB = haversine(b.lat, b.lon, run.vehicle.lat, run.vehicle.lon);
-      if (dA + dB > 0) frac = Math.min(0.95, Math.max(0.05, dA / (dA + dB)));
-    }
-  }
-  const top = Math.max(0, prevIdx + frac) * H + H / 2;
+  const pos = computeRailPosition(run, stops, now);
+  if (pos == null) return null;
+  const top = Math.max(0, pos) * H + H / 2;
   const eta = run.nextStopId ? run.etas.get(run.nextStopId) : null;
   const old = run.feedTs && (now - run.feedTs > STALE_VEHICLE);
 
   const m = document.createElement('div');
   m.className = 'bus-marker' + (old ? ' faded' : '');
+  m.dataset.vid = run.vehId;
   m.style.top = top + 'px';
   m.innerHTML = `
     <div class="bus-dot" style="background:${run.color}">🚌</div>
@@ -933,9 +1663,8 @@ function buildBusMarker(run, stops, now, H) {
   return m;
 }
 
-/* ── Map (optional, Leaflet) ────────────────────────────────────────────── */
+/* ── Map (Leaflet) ──────────────────────────────────────────────────────── */
 async function enableMap() {
-  document.getElementById('map-wrap').classList.remove('hidden');
   if (!map) {
     await loadLeaflet();
     map = L.map('map', { zoomControl: true }).setView([45.402, -75.642], 13);
@@ -945,7 +1674,9 @@ async function enableMap() {
     }).addTo(map);
     mapLayers = { shapes: L.layerGroup().addTo(map),
                   stops:  L.layerGroup().addTo(map),
-                  buses:  L.layerGroup().addTo(map) };
+                  trails: L.layerGroup().addTo(map),
+                  buses:  L.layerGroup().addTo(map),
+                  ghosts: L.layerGroup().addTo(map) };
   }
   // Leaflet measures its container at init. If we were hidden when it was
   // first attached (or if the toggle was just flipped on), the container
@@ -1041,22 +1772,68 @@ function drawMapStatic() {
 function renderMap() {
   if (!mapLayers) return;
   mapLayers.buses.clearLayers();
+  mapLayers.trails.clearLayers();
+  mapLayers.ghosts.clearLayers();
+  const now = serverNow();
   for (const run of runs) {
     const v = run.vehicle;
     if (!v || v.lat == null) continue;
-    const icon = L.divIcon({
-      className: '', iconSize: [26, 26],
-      html: `<div class="bus-pin" style="background:${run.color}">
-               ${esc(run.short)}</div>`,
-    });
+    const pred = predictVehiclePosition(run);
     const eta = run.nextStopId ? run.etas.get(run.nextStopId) : null;
     const next = run.nextStopId && GTFS.stops[run.nextStopId]
       ? GTFS.stops[run.nextStopId].name : '—';
-    L.marker([v.lat, v.lon], { icon })
+
+    // 1) Fading trail of recent GPS fixes (latest is most opaque).
+    const hist = vehicleHistory.get(run.vehId) || [];
+    if (hist.length >= 2) {
+      for (let i = 1; i < hist.length; i++) {
+        const a = hist[i - 1], b = hist[i];
+        L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+          color: run.color, weight: 3,
+          opacity: 0.18 + 0.7 * (i / hist.length),
+          dashArray: i < hist.length - 1 ? '4,4' : null,
+        }).addTo(mapLayers.trails);
+      }
+    }
+
+    // 2) GPS-fix pin (always at the *last reported* position, not predicted).
+    const fixIcon = L.divIcon({
+      className: '', iconSize: [22, 22],
+      html: `<div class="bus-pin fix" style="background:${run.color}">
+               ${esc(run.short)}</div>`,
+    });
+    L.marker([v.lat, v.lon], { icon: fixIcon })
       .bindPopup(`<strong>Route ${esc(run.short)}</strong> → ${esc(run.headsign)}<br>
-        Bus #${esc(v.id)}<br>Next: ${esc(next)}
-        ${eta ? ' · ' + fmtEta(eta - serverNow()) : ''}`)
+        Bus #${esc(v.id)}<br>
+        GPS ${fmtAgo(now - (v.ts || now))} ago<br>
+        Next: ${esc(next)}${eta ? ' · ' + fmtEta(eta - now) : ''}`)
       .addTo(mapLayers.buses);
+
+    // 3) Predicted-now ghost (calculus along route polyline). Only when we
+    //    actually advanced — skip when prediction == GPS.
+    if (prefs.ghost !== false && pred && pred.predicted && !pred.lost) {
+      const ghostIcon = L.divIcon({
+        className: '', iconSize: [26, 26],
+        html: `<div class="bus-pin ghost" style="border-color:${run.color}">
+                 <span>${esc(run.short)}</span></div>`,
+      });
+      L.marker([pred.lat, pred.lon], { icon: ghostIcon, interactive: false })
+        .addTo(mapLayers.ghosts);
+      // Thin line from last GPS to predicted-now position.
+      L.polyline([[v.lat, v.lon], [pred.lat, pred.lon]], {
+        color: run.color, weight: 2, opacity: 0.6, dashArray: '2,4',
+        interactive: false,
+      }).addTo(mapLayers.ghosts);
+    }
+    if (pred && pred.lost) {
+      // Faint X-ish marker so a "lost" bus is visible at all.
+      const lostIcon = L.divIcon({
+        className: '', iconSize: [22, 22],
+        html: `<div class="bus-pin lost">${esc(run.short)}</div>`,
+      });
+      L.marker([v.lat, v.lon], { icon: lostIcon, interactive: false })
+        .addTo(mapLayers.ghosts);
+    }
   }
 }
 
@@ -1310,6 +2087,12 @@ function fmtAgo(sec) {
 }
 function fmtDist(m) {
   return m < 1000 ? Math.round(m) + ' m' : (m / 1000).toFixed(1) + ' km';
+}
+function fmtBytes(n) {
+  if (n == null) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' kB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
 function fmtClock(unix) {
   return new Date(unix * 1000).toLocaleTimeString([],

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>OC Transpo Live — Bus Timeline</title>
 <meta name="description" content="Live OC Transpo bus locations and arrival times as a route timeline.">
 <meta name="theme-color" content="#ffffff" id="theme-color-meta">
@@ -24,9 +24,10 @@
     <span class="brand-mark">🚌</span>
     <span class="brand-text">OC Transpo <strong>Live</strong></span>
   </div>
-  <div id="freshness" class="pill pill-muted" title="Feed freshness">
+  <button id="freshness" class="pill pill-muted" type="button"
+          title="Tap for diagnostics">
     <span class="pill-dot"></span><span id="freshness-text">connecting…</span>
-  </div>
+  </button>
   <button id="refresh-btn" class="icon-btn" title="Refresh now">⟳</button>
 </header>
 
@@ -77,6 +78,10 @@
         <span>Compact timelines</span>
       </label>
       <label class="row-toggle">
+        <input type="checkbox" id="ghost-toggle">
+        <span>Predicted-position ghosts</span>
+      </label>
+      <label class="row-toggle">
         <input type="checkbox" id="map-toggle">
         <span>Show live map</span>
       </label>
@@ -106,15 +111,69 @@
   </aside>
 
   <section id="content">
-    <div id="departures-board"></div>
-    <div id="map-wrap" class="hidden"><div id="map"></div></div>
-    <div id="timelines"></div>
-    <div id="empty-state" class="empty-state hidden">
-      No lines selected — pick one or more under <strong>Lines</strong>.
+
+    <!-- Tab: Now — glanceable arrivals + alerts + status -->
+    <div class="tab-pane" data-tab="now">
+      <div id="now-alert" class="now-alert hidden"></div>
+      <div id="now-board"></div>
+      <div id="now-status" class="now-status"></div>
+      <div id="now-routes" class="now-routes"></div>
     </div>
+
+    <!-- Tab: Routes — full timelines (existing behaviour) -->
+    <div class="tab-pane" data-tab="routes" hidden>
+      <div id="departures-board"></div>
+      <div id="timelines"></div>
+      <div id="empty-state" class="empty-state hidden">
+        No lines selected — pick one or more under <strong>Lines</strong>.
+      </div>
+    </div>
+
+    <!-- Tab: Map — live map with predicted-position trails -->
+    <div class="tab-pane" data-tab="map" hidden>
+      <div id="map-wrap"><div id="map"></div></div>
+      <div class="map-legend">
+        <span><span class="leg-dot solid"></span>GPS fix</span>
+        <span><span class="leg-dot ghost"></span>Predicted now</span>
+        <span><span class="leg-dot trail"></span>Recent path</span>
+      </div>
+    </div>
+
+    <!-- Tab: More — mobile-only mirror of the sidebar -->
+    <div class="tab-pane" data-tab="more" hidden>
+      <div id="more-host"></div>
+    </div>
+
   </section>
 
 </main>
+
+<!-- Bottom tab bar (mobile-only). -->
+<nav id="tabbar" aria-label="Primary">
+  <button class="tab-btn" data-tab="now"    aria-current="page">
+    <span class="tab-ico">⏱</span><span class="tab-lbl">Now</span></button>
+  <button class="tab-btn" data-tab="routes">
+    <span class="tab-ico">≡</span><span class="tab-lbl">Routes</span></button>
+  <button class="tab-btn" data-tab="map">
+    <span class="tab-ico">🗺</span><span class="tab-lbl">Map</span></button>
+  <button class="tab-btn" data-tab="more">
+    <span class="tab-ico">⋯</span><span class="tab-lbl">More</span></button>
+</nav>
+
+<!-- Diagnostics modal (opens from the freshness pill). -->
+<div id="diag-modal" class="modal hidden" role="dialog" aria-modal="true"
+     aria-labelledby="diag-title">
+  <div class="modal-card">
+    <header class="modal-head">
+      <h3 id="diag-title">Diagnostics</h3>
+      <button class="icon-btn modal-close" id="diag-close" aria-label="Close">✕</button>
+    </header>
+    <div class="modal-body" id="diag-body">Loading…</div>
+    <footer class="modal-foot">
+      <button class="wide-btn" id="diag-refresh">Refresh</button>
+    </footer>
+  </div>
+</div>
 
 <div id="backdrop" class="hidden"></div>
 <div id="toast" class="toast hidden"></div>
